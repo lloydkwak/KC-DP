@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  kc_dp_env:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: kc_dp_container
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ../:/workspace
+    working_dir: /workspace
+    ipc: host
+    command: tail -f /dev/null
