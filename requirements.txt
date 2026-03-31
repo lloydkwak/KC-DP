@@ -1,0 +1,36 @@
+# requirements.txt
+
+# ==========================================
+# Core Deep Learning & Math
+# ==========================================
+torch>=2.0.0
+numpy>=1.22.0
+scipy
+
+# ==========================================
+# Kinematics & Robotics
+# ==========================================
+# Pinocchio for lightning-fast Jacobian and forward kinematics
+pinocchio
+
+# ==========================================
+# Configuration & Experiment Management
+# ==========================================
+# Hydra is critical for dynamically parsing the train_kc_dp.yaml file
+hydra-core>=1.2.0
+omegaconf
+
+# ==========================================
+# Data Processing & Storage
+# ==========================================
+# Required for loading Robomimic datasets and storing states
+h5py
+zarr
+
+# ==========================================
+# Utilities & Logging
+# ==========================================
+tqdm
+# Weights & Biases for monitoring training loss and performance
+wandb
+tensorboard
