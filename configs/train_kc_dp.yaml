@@ -1,12 +1,12 @@
 # configs/train_kc_dp.yaml
+
 defaults:
   - task: lift_lowdim
   - _self_
 
 name: train_kc_dp_lowdim
 
-# Define the augmented observation dimension dynamically
-# Base lift_lowdim obs_dim is 19. We append 42D k(q).
+# Dynamically evaluates the augmented observation dimension (base + 42)
 augmented_obs_dim: ${eval:'${task.obs_dim} + 42'}
 
 task:
@@ -20,26 +20,29 @@ task:
     val_ratio: 0.02
     max_train_episodes: 90
     
-    k_mean: null
-    k_std: null
+    # Injects the precomputed statistics dynamically
+    k_mean: ${load_stats:data/k_q_stats.pt,mean}
+    k_std: ${load_stats:data/k_q_stats.pt,std}
     
     virtual_sampler:
       _target_: kc_dp.kinematics.virtual_sampler.VirtualRobotSampler
-      base_urdf_path: third_party/diffusion_policy/diffusion_policy/env/block_pushing/assets/ur5e/ur5e.urdf 
-      ee_frame_name: ee_link
+      # CRITICAL: Path to the Panda URDF matching the 7-DoF dataset
+      base_urdf_path: third_party/diffusion_policy/diffusion_policy/env/kitchen/third_party/franka/franka_panda.urdf 
+      ee_frame_name: panda_hand
       max_dof: 7
       
     base_kinematic_module:
       _target_: kc_dp.kinematics.feature_extractor.AnalyticKinematicModule
-      urdf_path: third_party/diffusion_policy/diffusion_policy/env/block_pushing/assets/ur5e/ur5e.urdf
-      ee_frame_name: ee_link
+      # CRITICAL: Same path as above
+      urdf_path: third_party/diffusion_policy/diffusion_policy/env/kitchen/third_party/franka/franka_panda.urdf
+      ee_frame_name: panda_hand
       max_dof: 7
 
-# By leveraging the Ultimate Solution, we use the pristine, untouched policy!
+# Retains the completely unmodified baseline U-Net policy
 policy:
   _target_: diffusion_policy.policy.diffusion_unet_lowdim_policy.DiffusionUnetLowdimPolicy
   
   model:
     _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
-    # The pure policy network now seamlessly absorbs our appended kinematics!
+    # Absorbs the extra 42 dimensions seamlessly
     global_cond_dim: ${eval:'${augmented_obs_dim} * ${n_obs_steps}'}

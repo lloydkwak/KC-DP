@@ -13,18 +13,16 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
     """
     Hierarchical Kinematic Modulation (HKM) Dataset Wrapper.
     
-    This class wraps the baseline dataset to inject 42D kinematic features (k_q).
-    Crucially, it appends the normalized k_q directly to the aggregated 'obs' tensor 
-    and dynamically expands the dataset's internal ParameterDict normalizer. 
-    This architectural choice allows the downstream Diffusion Policy to remain pristine.
+    Dynamically generates virtual robots, computes normalized k(q) features, 
+    and seamlessly expands the core U-Net observation tensor and normalizer.
     """
 
     def __init__(self,
                  *args,
                  virtual_sampler: Optional[VirtualRobotSampler] = None,
                  base_kinematic_module: Optional[AnalyticKinematicModule] = None,
-                 k_mean: Optional[np.ndarray] = None,
-                 k_std: Optional[np.ndarray] = None,
+                 k_mean: Optional[Any] = None, # Typed to accept Hydra ListConfig
+                 k_std: Optional[Any] = None,  # Typed to accept Hydra ListConfig
                  **kwargs):
         super().__init__(*args, **kwargs)
         
@@ -34,11 +32,24 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         if self.virtual_sampler is None and self.base_kinematic_module is None:
             raise ValueError("Either virtual_sampler or base_kinematic_module must be provided.")
             
-        # Normalization statistics for k(q)
-        self.k_mean = torch.from_numpy(k_mean).float() if k_mean is not None else torch.zeros(42)
-        self.k_std = torch.from_numpy(k_std).float() if k_std is not None else torch.ones(42)
+        # Type-Safe Tensor Initialization:
+        # Casts Python lists/ListConfigs to numpy arrays, then to PyTorch tensors.
+        if k_mean is not None:
+            k_mean_np = np.array(k_mean, dtype=np.float32)
+            self.k_mean = torch.from_numpy(k_mean_np).float()
+        else:
+            self.k_mean = torch.zeros(42)
+            
+        if k_std is not None:
+            k_std_np = np.array(k_std, dtype=np.float32)
+            self.k_std = torch.from_numpy(k_std_np).float()
+        else:
+            self.k_std = torch.ones(42)
+            
+        # Prevent division-by-zero instability during normalization
         self.k_std = torch.clamp(self.k_std, min=1e-6)
         
+        # Epoch-level cache for virtual kinematic modules
         self._vmodule_cache: Dict[int, Tuple[AnalyticKinematicModule, np.ndarray, np.ndarray]] = {}
         self._build_episode_mapping()
 
@@ -75,12 +86,15 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         q_traj_full = self.replay_buffer['robot0_joint_pos'][start_idx:end_idx]
         T = len(q_traj_full)
         
+        # Calculate finite difference velocity
         delta_q = np.zeros_like(q_traj_full)
         if T > 1:
             delta_q[:-1] = q_traj_full[1:] - q_traj_full[:-1]
             delta_q[-1] = delta_q[-2]
             
         delta_pose_actual = np.zeros((T, 6))
+        
+        # Worker-local data object prevents race conditions in PyTorch DataLoader
         local_base_data = self.base_kinematic_module.model.createData()
         
         for t in range(T):
@@ -95,6 +109,8 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         q_min_v, q_max_v = self.virtual_sampler.sample_stage1_limits(
             np.min(q_traj_full, axis=0), np.max(q_traj_full, axis=0)
         )
+        
+        # Stage 2 morphological augmentation ensuring physical feasibility
         v_module, q_min_v, q_max_v = self.virtual_sampler.sample_stage2_module(
             q_traj_full, delta_pose_actual, q_min_v, q_max_v
         )
@@ -105,25 +121,22 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
 
     def get_normalizer(self, mode='limits', **kwargs):
         """
-        Overrides the parent's normalizer generation to seamlessly accommodate the 
-        appended 42D k(q) tensor. Directly mutates the internal nn.ParameterDict.
+        Dynamically expands the parent normalizer's ParameterDict to accommodate 
+        the pre-normalized 42D k(q) tensor using an identity mapping.
         """
         normalizer = super().get_normalizer(mode=mode, **kwargs)
-        obs_norm = normalizer['obs'] # SingleFieldLinearNormalizer
-        obs_params = obs_norm.params_dict # nn.ParameterDict
+        obs_norm = normalizer['obs'] 
+        obs_params = obs_norm.params_dict 
         
         device = obs_params['offset'].device
         dtype = obs_params['offset'].dtype
         
-        # 1. Create identity parameters for the 42D k(q) vector
         identity_offset = torch.zeros(42, dtype=dtype, device=device)
         identity_scale = torch.ones(42, dtype=dtype, device=device)
         
-        # 2. Append to core transform parameters
         obs_params['offset'] = nn.Parameter(torch.cat([obs_params['offset'], identity_offset], dim=-1))
         obs_params['scale'] = nn.Parameter(torch.cat([obs_params['scale'], identity_scale], dim=-1))
         
-        # 3. Safely expand internal statistical tracking buffers
         if 'input_stats' in obs_params:
             stats = obs_params['input_stats']
             for stat_key in stats.keys():
@@ -135,13 +148,8 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         return normalizer
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Fetches the aggregated observation tensor, computes k(q) utilizing virtual 
-        morphologies, and safely concatenates it into the main observation tensor.
-        """
         item = super().__getitem__(idx)
         
-        # Redundant safe extraction to decouple from parent tensor slicing logic
         raw_sample = self.sampler.sample_sequence(idx)
         q_window_np = raw_sample['robot0_joint_pos']
         
@@ -155,7 +163,7 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         k_q_tensor = torch.from_numpy(k_q_np).float()
         k_q_normalized = (k_q_tensor - self.k_mean) / self.k_std
         
-        # Dynamically expand the 'obs' tensor to match the mutated Normalizer
+        # Ultimate Concatenation: Append to the unified observation tensor
         item['obs'] = torch.cat([item['obs'], k_q_normalized], dim=-1)
         
         return item
