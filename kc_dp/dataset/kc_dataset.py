@@ -1,169 +1,281 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import h5py
 from typing import Dict, Any, Optional, Tuple
 
 import pinocchio as pin
 
-from diffusion_policy.dataset.robomimic_replay_lowdim_dataset import RobomimicReplayLowdimDataset
+from diffusion_policy.dataset.robomimic_replay_lowdim_dataset import (
+    RobomimicReplayLowdimDataset,
+)
 from kc_dp.kinematics.feature_extractor import AnalyticKinematicModule
 from kc_dp.kinematics.virtual_sampler import VirtualRobotSampler
+
 
 class HKMLowdimDataset(RobomimicReplayLowdimDataset):
     """
     Hierarchical Kinematic Modulation (HKM) Dataset Wrapper.
-    
-    Dynamically generates virtual robots, computes normalized k(q) features, 
-    and seamlessly expands the core U-Net observation tensor and normalizer.
+
+    The parent class concatenates all obs_keys into a single 'obs' array and
+    stores only 'obs' and 'action' in the ReplayBuffer — individual keys like
+    'robot0_joint_pos' are *not* preserved.  This class re-reads the HDF5 to
+    inject 'robot0_joint_pos' as a separate ReplayBuffer column so that k(q)
+    can be computed per-timestep.
     """
 
-    def __init__(self,
-                 *args,
-                 virtual_sampler: Optional[VirtualRobotSampler] = None,
-                 base_kinematic_module: Optional[AnalyticKinematicModule] = None,
-                 k_mean: Optional[Any] = None, # Typed to accept Hydra ListConfig
-                 k_std: Optional[Any] = None,  # Typed to accept Hydra ListConfig
-                 **kwargs):
+    def __init__(
+        self,
+        *args,
+        virtual_sampler: Optional[VirtualRobotSampler] = None,
+        base_kinematic_module: Optional[AnalyticKinematicModule] = None,
+        k_mean: Optional[Any] = None,
+        k_std: Optional[Any] = None,
+        **kwargs,
+    ):
+        # ── 1. Build the parent dataset (creates self.replay_buffer) ──
+        # We need dataset_path before super().__init__ consumes it.
+        # It is either the first positional arg or a keyword arg.
+        if args:
+            dataset_path = args[0]
+        else:
+            dataset_path = kwargs.get("dataset_path")
+        if dataset_path is None:
+            raise ValueError("dataset_path must be provided.")
+
         super().__init__(*args, **kwargs)
-        
+
+        # ── 2. Re-read robot0_joint_pos from HDF5 and inject into buffer ──
+        self._inject_joint_pos(dataset_path)
+
+        # ── 3. HKM-specific attributes ──
         self.virtual_sampler = virtual_sampler
         self.base_kinematic_module = base_kinematic_module
-        
+
         if self.virtual_sampler is None and self.base_kinematic_module is None:
-            raise ValueError("Either virtual_sampler or base_kinematic_module must be provided.")
-            
-        # Type-Safe Tensor Initialization:
-        # Casts Python lists/ListConfigs to numpy arrays, then to PyTorch tensors.
+            raise ValueError(
+                "Either virtual_sampler or base_kinematic_module must be provided."
+            )
+
+        # Type-safe tensor init (accepts list / ListConfig from Hydra)
         if k_mean is not None:
-            k_mean_np = np.array(k_mean, dtype=np.float32)
-            self.k_mean = torch.from_numpy(k_mean_np).float()
+            self.k_mean = torch.from_numpy(
+                np.array(k_mean, dtype=np.float32)
+            ).float()
         else:
-            self.k_mean = torch.zeros(42)
-            
+            stats = torch.load('data/k_q_stats.pt', map_location='cpu'); self.k_mean = torch.as_tensor(stats['mean']).float()
+
         if k_std is not None:
-            k_std_np = np.array(k_std, dtype=np.float32)
-            self.k_std = torch.from_numpy(k_std_np).float()
+            self.k_std = torch.from_numpy(
+                np.array(k_std, dtype=np.float32)
+            ).float()
         else:
-            self.k_std = torch.ones(42)
-            
-        # Prevent division-by-zero instability during normalization
+            self.k_std = torch.as_tensor(stats['std']).float()
         self.k_std = torch.clamp(self.k_std, min=1e-6)
-        
-        # Epoch-level cache for virtual kinematic modules
-        self._vmodule_cache: Dict[int, Tuple[AnalyticKinematicModule, np.ndarray, np.ndarray]] = {}
+
+        # Virtual-module cache (cleared every epoch)
+        self._vmodule_cache: Dict[
+            int, Tuple[AnalyticKinematicModule, np.ndarray, np.ndarray]
+        ] = {}
         self._build_episode_mapping()
+
+    # ------------------------------------------------------------------
+    # HDF5 re-read
+    # ------------------------------------------------------------------
+
+    def _inject_joint_pos(self, dataset_path: str):
+        """
+        Reads 'robot0_joint_pos' from every demo in the HDF5 and appends it
+        as a new column in self.replay_buffer so that downstream code can
+        access it via self.replay_buffer['robot0_joint_pos'].
+        """
+        all_joint_pos = []
+        with h5py.File(dataset_path, "r") as f:
+            demos = f["data"]
+            for i in range(len(demos)):
+                jp = demos[f"demo_{i}"]["obs"]["robot0_joint_pos"][:]
+                all_joint_pos.append(jp.astype(np.float32))
+        joint_pos_all = np.concatenate(all_joint_pos, axis=0)
+
+        # Sanity: length must match the existing buffer
+        assert joint_pos_all.shape[0] == self.replay_buffer.n_steps, (
+            f"joint_pos length {joint_pos_all.shape[0]} != "
+            f"replay_buffer n_steps {self.replay_buffer.n_steps}"
+        )
+
+        # ReplayBuffer has no __setitem__; write directly into the backing store.
+        self.replay_buffer.root['data']['robot0_joint_pos'] = joint_pos_all
+
+    # ------------------------------------------------------------------
+    # Episode mapping
+    # ------------------------------------------------------------------
 
     def _build_episode_mapping(self):
         episode_ends = self.replay_buffer.episode_ends[:]
-        total_raw_steps = episode_ends[-1]
-        
+        total_raw_steps = int(episode_ends[-1])
+
         self.raw_to_ep = np.zeros(total_raw_steps, dtype=int)
         starts = np.insert(episode_ends[:-1], 0, 0)
         for ep_idx, (start, end) in enumerate(zip(starts, episode_ends)):
-            self.raw_to_ep[start:end] = ep_idx
-            
+            self.raw_to_ep[int(start) : int(end)] = ep_idx
+
     def clear_epoch_cache(self):
         self._vmodule_cache.clear()
 
-    def _get_or_create_virtual_module(self, ep_idx: int) -> Tuple[AnalyticKinematicModule, np.ndarray, np.ndarray]:
+    # ------------------------------------------------------------------
+    # Virtual module creation (Stage 1 + 2)
+    # ------------------------------------------------------------------
+
+    def _get_or_create_virtual_module(
+        self, ep_idx: int
+    ) -> Tuple[AnalyticKinematicModule, np.ndarray, np.ndarray]:
         if ep_idx in self._vmodule_cache:
             return self._vmodule_cache[ep_idx]
-            
+
+        n_dof = self.replay_buffer["robot0_joint_pos"].shape[1]
+
         if self.virtual_sampler is None:
             model = self.base_kinematic_module.model
-            n_dof = self.replay_buffer['robot0_joint_pos'].shape[1]
-            q_min = np.where(np.isinf(model.lowerPositionLimit[:n_dof]), -2 * np.pi, model.lowerPositionLimit[:n_dof])
-            q_max = np.where(np.isinf(model.upperPositionLimit[:n_dof]), 2 * np.pi, model.upperPositionLimit[:n_dof])
-            
+            q_min = np.where(
+                np.isinf(model.lowerPositionLimit[:n_dof]),
+                -2 * np.pi,
+                model.lowerPositionLimit[:n_dof],
+            )
+            q_max = np.where(
+                np.isinf(model.upperPositionLimit[:n_dof]),
+                2 * np.pi,
+                model.upperPositionLimit[:n_dof],
+            )
             result = (self.base_kinematic_module, q_min, q_max)
             self._vmodule_cache[ep_idx] = result
             return result
-            
+
+        # Full episode joint trajectory
         episode_ends = self.replay_buffer.episode_ends[:]
-        start_idx = 0 if ep_idx == 0 else episode_ends[ep_idx - 1]
-        end_idx = episode_ends[ep_idx]
-        
-        q_traj_full = self.replay_buffer['robot0_joint_pos'][start_idx:end_idx]
+        start_idx = 0 if ep_idx == 0 else int(episode_ends[ep_idx - 1])
+        end_idx = int(episode_ends[ep_idx])
+
+        q_traj_full = self.replay_buffer["robot0_joint_pos"][start_idx:end_idx]
         T = len(q_traj_full)
-        
-        # Calculate finite difference velocity
+
+        # Finite-difference joint velocity
         delta_q = np.zeros_like(q_traj_full)
         if T > 1:
             delta_q[:-1] = q_traj_full[1:] - q_traj_full[:-1]
             delta_q[-1] = delta_q[-2]
-            
+
         delta_pose_actual = np.zeros((T, 6))
-        
-        # Worker-local data object prevents race conditions in PyTorch DataLoader
-        local_base_data = self.base_kinematic_module.model.createData()
-        
+        # Worker-local data to avoid multi-process race conditions
+        local_data = self.base_kinematic_module.model.createData()
+
         for t in range(T):
-            q_t = q_traj_full[t]
-            pin.framesForwardKinematics(self.base_kinematic_module.model, local_base_data, q_t)
-            J_base = pin.computeFrameJacobian(
-                self.base_kinematic_module.model, local_base_data, q_t, 
-                self.base_kinematic_module.ee_frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+            q_arm = q_traj_full[t]
+            # Pad arm-only q (e.g. 7D) to full model config (e.g. 9D)
+            q_full = self.base_kinematic_module._pad_q(q_arm)
+            pin.framesForwardKinematics(
+                self.base_kinematic_module.model, local_data, q_full
             )
-            delta_pose_actual[t] = J_base @ delta_q[t]
-        
+            J_full = pin.computeFrameJacobian(
+                self.base_kinematic_module.model,
+                local_data,
+                q_full,
+                self.base_kinematic_module.ee_frame_id,
+                pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+            )
+            # Use only arm-chain Jacobian columns
+            J_arm = J_full[:, self.base_kinematic_module._arm_q_indices[:q_traj_full.shape[1]]]
+            delta_pose_actual[t] = J_arm @ delta_q[t]
+
+        # Stage 1 + 2
         q_min_v, q_max_v = self.virtual_sampler.sample_stage1_limits(
             np.min(q_traj_full, axis=0), np.max(q_traj_full, axis=0)
         )
-        
-        # Stage 2 morphological augmentation ensuring physical feasibility
         v_module, q_min_v, q_max_v = self.virtual_sampler.sample_stage2_module(
             q_traj_full, delta_pose_actual, q_min_v, q_max_v
         )
-        
+
         result = (v_module, q_min_v, q_max_v)
         self._vmodule_cache[ep_idx] = result
         return result
 
-    def get_normalizer(self, mode='limits', **kwargs):
+    # ------------------------------------------------------------------
+    # Normalizer expansion
+    # ------------------------------------------------------------------
+
+    def get_normalizer(self, mode="limits", **kwargs):
         """
-        Dynamically expands the parent normalizer's ParameterDict to accommodate 
-        the pre-normalized 42D k(q) tensor using an identity mapping.
+        Expands the parent's obs normalizer by 42 identity-scaled dims for k(q).
         """
         normalizer = super().get_normalizer(mode=mode, **kwargs)
-        obs_norm = normalizer['obs'] 
-        obs_params = obs_norm.params_dict 
-        
-        device = obs_params['offset'].device
-        dtype = obs_params['offset'].dtype
-        
-        identity_offset = torch.zeros(42, dtype=dtype, device=device)
-        identity_scale = torch.ones(42, dtype=dtype, device=device)
-        
-        obs_params['offset'] = nn.Parameter(torch.cat([obs_params['offset'], identity_offset], dim=-1))
-        obs_params['scale'] = nn.Parameter(torch.cat([obs_params['scale'], identity_scale], dim=-1))
-        
-        if 'input_stats' in obs_params:
-            stats = obs_params['input_stats']
-            for stat_key in stats.keys():
+        obs_params = normalizer["obs"].params_dict
+
+        device = obs_params["offset"].device
+        dtype = obs_params["offset"].dtype
+
+        obs_params["offset"] = nn.Parameter(
+            torch.cat(
+                [obs_params["offset"], torch.zeros(42, dtype=dtype, device=device)]
+            )
+        )
+        obs_params["scale"] = nn.Parameter(
+            torch.cat(
+                [obs_params["scale"], torch.ones(42, dtype=dtype, device=device)]
+            )
+        )
+
+        if "input_stats" in obs_params:
+            stats = obs_params["input_stats"]
+            for key in list(stats.keys()):
                 pad = torch.zeros(42, dtype=dtype, device=device)
-                if stat_key in ['std', 'max']:
+                if key in ("std", "max"):
                     pad = torch.ones(42, dtype=dtype, device=device)
-                stats[stat_key] = nn.Parameter(torch.cat([stats[stat_key], pad], dim=-1))
-                
+                stats[key] = nn.Parameter(torch.cat([stats[key], pad]))
+
         return normalizer
+
+    # ------------------------------------------------------------------
+    # __getitem__
+    # ------------------------------------------------------------------
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         item = super().__getitem__(idx)
-        
-        raw_sample = self.sampler.sample_sequence(idx)
-        q_window_np = raw_sample['robot0_joint_pos']
-        
-        idx_info = self.sampler.indices[idx]
-        raw_start_idx = int(idx_info[0]) if isinstance(idx_info, (tuple, list, np.ndarray)) else int(idx_info)
-        ep_idx = self.raw_to_ep[raw_start_idx]
-        
+
+        # ── Extract joint positions with proper padding ──
+        buf_start, buf_end, samp_start, samp_end = self.sampler.indices[idx]
+        seq_len = self.sampler.sequence_length
+
+        q_raw = self.replay_buffer["robot0_joint_pos"][buf_start:buf_end]
+
+        # Replicate the same padding logic as SequenceSampler.sample_sequence
+        if samp_start > 0 or samp_end < seq_len:
+            q_window = np.zeros(
+                (seq_len, q_raw.shape[1]), dtype=q_raw.dtype
+            )
+            if samp_start > 0:
+                q_window[:samp_start] = q_raw[0]
+            if samp_end < seq_len:
+                q_window[samp_end:] = q_raw[-1]
+            q_window[samp_start:samp_end] = q_raw
+        else:
+            q_window = q_raw
+
+        # ── Resolve episode index ──
+        raw_start_idx = int(buf_start)
+        # Clamp to valid range (buf_start can be 0 which is always valid)
+        ep_idx = self.raw_to_ep[min(raw_start_idx, len(self.raw_to_ep) - 1)]
+
+        # ── Compute k(q) ──
         v_module, q_min_v, q_max_v = self._get_or_create_virtual_module(ep_idx)
-        k_q_np = v_module.compute_k_q_with_custom_limits(q_window_np, q_min_v, q_max_v)
-        
-        k_q_tensor = torch.from_numpy(k_q_np).float()
-        k_q_normalized = (k_q_tensor - self.k_mean) / self.k_std
-        
-        # Ultimate Concatenation: Append to the unified observation tensor
-        item['obs'] = torch.cat([item['obs'], k_q_normalized], dim=-1)
-        
+        k_q_np = v_module.compute_k_q_with_custom_limits(
+            q_window, q_min_v, q_max_v
+        )
+
+        k_q = torch.from_numpy(k_q_np).float()
+        k_q_normalized = (k_q - self.k_mean) / self.k_std
+
+        # ── Concatenate onto the unified obs tensor ──
+        item["obs"] = torch.cat([item["obs"], k_q_normalized], dim=-1)
+
+        item.pop("robot0_joint_pos", None)
+
         return item

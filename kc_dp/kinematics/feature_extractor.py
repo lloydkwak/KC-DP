@@ -1,121 +1,142 @@
+import os
+import tempfile
 import numpy as np
 import pinocchio as pin
 
+
+def _build_model_from_xml_string(urdf_xml: str) -> pin.Model:
+    """
+    Builds a Pinocchio Model from a URDF XML string.
+    Falls back to tempfile when pin.buildModelFromXML is unavailable.
+    """
+    if hasattr(pin, "buildModelFromXML"):
+        return pin.buildModelFromXML(urdf_xml)
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".urdf", prefix="hkm_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(urdf_xml)
+        model = pin.buildModelFromUrdf(tmp_path)
+    finally:
+        os.remove(tmp_path)
+    return model
+
+
 class AnalyticKinematicModule:
     """
-    Computes kinematics and extracts the 42-dimensional k(q) feature vector 
-    using Pinocchio for high-performance rigid body algorithms.
+    Computes the 42-dimensional k(q) kinematic feature vector.
+
+    k(q) = [M*_vech(21), sin_enc(7), cos_enc(7), p_norm(3), quat(4)] = 42D
+
+    Handles the common case where demo data contains only arm joints
+    (e.g. 7D for Panda) while the URDF model includes extra joints like
+    gripper fingers (model.nq = 9).  Arm-chain joint indices are extracted
+    automatically from the EE kinematic chain.
     """
-    def __init__(self, urdf_path=None, urdf_xml=None, ee_frame_name='', max_dof=7):
-        """
-        Initializes the kinematic module from either a file path or an XML string.
-        
-        Args:
-            urdf_path: Path to the URDF file (used for the base robot).
-            urdf_xml: String containing the URDF XML (used for virtual robots).
-            ee_frame_name: Name of the end-effector frame in the URDF.
-            max_dof: Maximum degrees of freedom to pad the feature vector (default: 7).
-        """
-        # 1. Load the robot model safely
+
+    def __init__(self, urdf_path=None, urdf_xml=None, ee_frame_name="", max_dof=7):
+        # ── 1. Load robot model ──
         if urdf_xml is not None:
-            # Parse directly from the modified XML string (used by VirtualRobotSampler)
-            self.model = pin.buildModelFromXML(urdf_xml)
+            self.model = _build_model_from_xml_string(urdf_xml)
         elif urdf_path is not None:
-            # Parse from an existing URDF file (used for the base robot)
             self.model = pin.buildModelFromUrdf(urdf_path)
         else:
             raise ValueError("Either urdf_path or urdf_xml must be provided.")
 
         self.data = self.model.createData()
-        
-        # 2. Resolve the End-Effector (EE) frame ID
+
+        # ── 2. EE frame ──
         if not self.model.existFrame(ee_frame_name):
             raise ValueError(f"Frame '{ee_frame_name}' not found in the URDF.")
         self.ee_frame_id = self.model.getFrameId(ee_frame_name)
-        
-        # 3. Cache Degree of Freedom (DoF) settings
-        self.n_dof = self.model.nq
+
+        # ── 3. Identify arm-chain q-vector indices ──
+        parent_jid = self.model.frames[self.ee_frame_id].parentJoint
+        chain_jids = []
+        while parent_jid > 0:
+            chain_jids.append(parent_jid)
+            parent_jid = self.model.parents[parent_jid]
+        chain_jids.reverse()
+
+        self._arm_q_indices = []
+        for jid in chain_jids:
+            jnt = self.model.joints[jid]
+            if jnt.nq > 0:
+                for k in range(jnt.nq):
+                    self._arm_q_indices.append(jnt.idx_q + k)
+        self._arm_q_indices = np.array(self._arm_q_indices, dtype=int)
+
+        self.n_arm_dof = len(self._arm_q_indices)
+        self.n_model_q = self.model.nq
         self.max_dof = max_dof
 
-        # 4. Calculate Characteristic Length (L_char) and Scaling Matrix (S_matrix)
-        # This ensures scale invariance across different virtual link lengths (Stage 2).
-        q_zero = pin.neutral(self.model)
-        pin.framesForwardKinematics(self.model, self.data, q_zero)
-        ee_pos_zero = self.data.oMf[self.ee_frame_id].translation
-        
-        # Extract the scalar characteristic length, bounded to prevent division by zero
-        self.L_char = max(float(np.linalg.norm(ee_pos_zero)), 1e-3)
-        
-        # Construct the scaling matrix S: 
-        # Normalizes translational components by L_char, leaves rotational components intact.
+        # Neutral config used as padding template
+        self._q_neutral = pin.neutral(self.model).copy()
+
+        # ── 4. Characteristic length & scaling matrix ──
+        pin.framesForwardKinematics(self.model, self.data, self._q_neutral)
+        ee_pos = self.data.oMf[self.ee_frame_id].translation
+        self.L_char = max(float(np.linalg.norm(ee_pos)), 1e-3)
         self.S_matrix = np.diag([1.0 / self.L_char] * 3 + [1.0] * 3)
 
-    def compute_k_q_with_custom_limits(self, q_sequence: np.ndarray, q_min: np.ndarray, q_max: np.ndarray) -> np.ndarray:
+    # ------------------------------------------------------------------
+
+    def _pad_q(self, q_arm: np.ndarray) -> np.ndarray:
+        """Expand arm-only (n_arm_dof,) → full model config (n_model_q,)."""
+        q_full = self._q_neutral.copy()
+        q_full[self._arm_q_indices[: len(q_arm)]] = q_arm
+        return q_full
+
+    # ------------------------------------------------------------------
+
+    def compute_k_q_with_custom_limits(
+        self, q_sequence: np.ndarray, q_min: np.ndarray, q_max: np.ndarray,
+    ) -> np.ndarray:
         """
-        Computes the 42D kinematic feature vector k(q) for a sequence of joint positions,
-        incorporating range-weighting and scale invariance.
-        
         Args:
-            q_sequence: Sequence of joint positions, shape (T, n_dof)
-            q_min: Virtual lower joint limits
-            q_max: Virtual upper joint limits
-            
+            q_sequence: (T, n_data) — may be shorter than model.nq.
+            q_min, q_max: Virtual limits matching n_data.
         Returns:
-            k_q_sequence: The 42D kinematic feature sequence, shape (T, 42)
+            (T, 42) feature array.
         """
         T = q_sequence.shape[0]
-        k_q_sequence = np.zeros((T, 42))
-        
-        # Compute the valid joint range, bounded to prevent numerical instability
-        range_q = np.maximum(q_max - q_min, 1e-6)
-        
+        n_data = q_sequence.shape[1]
+        k_q_out = np.zeros((T, 42))
+
+        range_q = np.maximum(q_max[:n_data] - q_min[:n_data], 1e-6)
+
         for t in range(T):
-            q_t = q_sequence[t]
-            
-            # Forward kinematics and spatial Jacobian computation
-            pin.framesForwardKinematics(self.model, self.data, q_t)
-            J = pin.computeFrameJacobian(
-                self.model, self.data, q_t, self.ee_frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+            q_arm = q_sequence[t]
+            q_full = self._pad_q(q_arm)
+
+            pin.framesForwardKinematics(self.model, self.data, q_full)
+            J_full = pin.computeFrameJacobian(
+                self.model, self.data, q_full,
+                self.ee_frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
             )
-            
-            # 1. Range-weighted & L_char-normalized Manipulability (M*) - 21D
-            # Apply the scaling matrix to the Jacobian to ensure scale invariance
+            # Keep only arm-chain Jacobian columns
+            J = J_full[:, self._arm_q_indices[: n_data]]
+
+            # ── 1. Range-weighted, L_char-normalized M* — 21D ──
             J_norm = self.S_matrix @ J
-            
-            # Construct the diagonal penalty matrix D based on the active DoF limits
-            d_vec_t = 1.0 / (np.square(range_q[:self.n_dof]) + 1e-6)
-            D_matrix_t = np.diag(d_vec_t)
-            
-            # Calculate the manipulability matrix M* = J_norm * D * J_norm^T
-            # This matrix is symmetric positive definite (SPD)
-            M_star = J_norm @ D_matrix_t @ J_norm.T
-            m_star_vech = M_star[np.triu_indices(6)] # 21 dimensions
-            
-            # 2. Periodic Joint Encoding - 14D
-            # Map the joint position to [-pi, pi] relative to the virtual limits
-            q_normalized = 2 * np.pi * (q_t - q_min[:self.n_dof]) / range_q[:self.n_dof] - np.pi
-            
-            # Pad the encoding to the maximum specified degrees of freedom (e.g., 7)
-            q_norm_padded = np.zeros(self.max_dof)
-            q_norm_padded[:self.n_dof] = q_normalized
-            periodic_encoding = np.concatenate([np.sin(q_norm_padded), np.cos(q_norm_padded)]) # 14 dimensions
-            
-            # 3. L_char-normalized End-Effector Pose - 7D
+            d_vec = 1.0 / (np.square(range_q) + 1e-6)
+            M_star = J_norm @ np.diag(d_vec) @ J_norm.T
+            m_star_vech = M_star[np.triu_indices(6)]
+
+            # ── 2. Periodic joint encoding — 14D ──
+            q_normalized = 2.0 * np.pi * (q_arm - q_min[:n_data]) / range_q - np.pi
+            q_pad = np.zeros(self.max_dof)
+            q_pad[:n_data] = q_normalized
+            periodic = np.concatenate([np.sin(q_pad), np.cos(q_pad)])
+
+            # ── 3. L_char-normalized EE pose — 7D ──
             pose = self.data.oMf[self.ee_frame_id]
-            
-            # Normalize the positional translation vector by the characteristic length
             p_norm = pose.translation / self.L_char
-            
-            # Extract quaternion coefficients as an isolated numpy array [x, y, z, w]
-            quat = pin.Quaternion(pose.rotation).coeffs() 
-            
-            # Safely resolve quaternion sign ambiguity to ensure a continuous representation
+            quat = pin.Quaternion(pose.rotation).coeffs()
             if quat[3] < 0:
                 quat = -quat
-                
-            ee_pose = np.concatenate([p_norm, quat]) # 7 dimensions
-            
-            # Assemble the final 42D kinematic feature vector for the current timestep
-            k_q_sequence[t] = np.concatenate([m_star_vech, periodic_encoding, ee_pose])
-            
-        return k_q_sequence
+            ee_pose = np.concatenate([p_norm, quat])
+
+            k_q_out[t] = np.concatenate([m_star_vech, periodic, ee_pose])
+
+        return k_q_out

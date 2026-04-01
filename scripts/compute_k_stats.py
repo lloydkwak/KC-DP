@@ -30,6 +30,11 @@ try:
 except ValueError:
     pass
 
+try:
+    OmegaConf.register_new_resolver("eval", eval, replace=True)
+except ValueError:
+    pass
+
 @hydra.main(config_path="../configs", config_name="train_kc_dp", version_base="1.2")
 def main(cfg):
     """
