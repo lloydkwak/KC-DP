@@ -31,7 +31,6 @@ task:
     pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
-    max_train_episodes: 90
 
     virtual_sampler:
       _target_: kc_dp.kinematics.virtual_sampler.VirtualRobotSampler

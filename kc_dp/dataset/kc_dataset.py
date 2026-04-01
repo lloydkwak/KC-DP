@@ -79,6 +79,8 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         ] = {}
         self._build_episode_mapping()
 
+        self._getitem_count = 0
+
     # ------------------------------------------------------------------
     # HDF5 re-read
     # ------------------------------------------------------------------
@@ -238,6 +240,14 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
     # ------------------------------------------------------------------
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        self._getitem_count += 1
+
+        # In a multi-worker environment (num_workers > 0), each worker has its own copy of the dataset.
+        # We refresh the cache roughly once per epoch per worker.
+        # Using 1/10th of len(self) is a safe heuristic for most multi-worker setups.
+        if self._getitem_count % max(1, len(self) // 10) == 0: #
+            self.clear_epoch_cache()
+
         item = super().__getitem__(idx)
 
         # ── Extract joint positions with proper padding ──
