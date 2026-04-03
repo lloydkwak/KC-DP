@@ -21,7 +21,7 @@ def load_stats(path: str, key: str):
         try:
             stats = torch.load(path)
             return stats[key]
-        except Exception as e:
+        except Exception:
             pass
     return None
 
@@ -35,6 +35,7 @@ try:
 except ValueError:
     pass
 
+
 @hydra.main(config_path="../configs", config_name="train_kc_dp", version_base="1.2")
 def main(cfg):
     """
@@ -43,6 +44,13 @@ def main(cfg):
     print("Starting k(q) statistics computation with kinematic augmentation...")
     
     dataset = hydra.utils.instantiate(cfg.task.dataset)
+    
+    # [CRITICAL FIX] NORMALIZATION DEATH LOOP PREVENTION
+    # Force the dataset to output raw, unnormalized k(q) features by 
+    # resetting the internal normalizers to 0 (mean) and 1 (std).
+    dataset.k_mean = torch.zeros(42, dtype=torch.float32)
+    dataset.k_std = torch.ones(42, dtype=torch.float32)
+    
     num_samples = len(dataset)
     print(f"Total trajectory windows to process: {num_samples}")
 
@@ -55,7 +63,7 @@ def main(cfg):
             
         item = dataset[i]
         
-        # Slice only the raw k_q dimensions appended at the end of the tensor
+        # Extract the raw 42D k(q) vector appended at the end of the observation tensor
         k_q = item['obs'][..., -42:] 
         all_k_q.append(k_q.reshape(-1, 42))
 
@@ -64,7 +72,7 @@ def main(cfg):
     k_mean = all_k_q_tensor.mean(dim=0).numpy().tolist()
     k_std = all_k_q_tensor.std(dim=0).numpy()
     
-    # Clip standard deviation to prevent future division-by-zero
+    # Clip standard deviation to prevent future division-by-zero errors
     k_std = np.clip(k_std, a_min=1e-6, a_max=None).tolist()
     
     # Anchor the output path to the absolute project root

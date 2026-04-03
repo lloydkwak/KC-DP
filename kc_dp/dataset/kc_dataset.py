@@ -33,6 +33,8 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         k_std: Optional[Any] = None,
         **kwargs,
     ):
+        kwargs.pop("zarr_path", None)
+
         # ── 1. Build the parent dataset (creates self.replay_buffer) ──
         # We need dataset_path before super().__init__ consumes it.
         # It is either the first positional arg or a keyword arg.
@@ -40,6 +42,7 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
             dataset_path = args[0]
         else:
             dataset_path = kwargs.get("dataset_path")
+            
         if dataset_path is None:
             raise ValueError("dataset_path must be provided.")
 

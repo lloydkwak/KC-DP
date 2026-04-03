@@ -64,7 +64,7 @@ class VirtualRobotSampler:
     ) -> Tuple[np.ndarray, np.ndarray]:
         r_actual = q_traj_max - q_traj_min
         min_range_rad = np.radians(60.0)
-        max_range_rad = np.radians(315.0)
+        max_range_rad = np.radians(360.0) 
 
         q_min_v = np.zeros_like(q_traj_min)
         q_max_v = np.zeros_like(q_traj_max)
