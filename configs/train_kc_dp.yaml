@@ -3,13 +3,14 @@
 hydra:
   searchpath:
     - file://third_party/diffusion_policy/diffusion_policy/config
-    - pkg://diffusion_policy.config
 
 defaults:
   - train_diffusion_unet_lowdim_workspace
+  - override /task: can_lowdim_abs
   - _self_
 
 name: train_kc_dp_lowdim
+_target_: kc_dp.workspace.train_kc_diffusion_unet_lowdim_workspace.TrainKCDiffusionUnetLowdimWorkspace
 n_latency_steps: 0
 horizon: 16
 n_obs_steps: 2
@@ -29,8 +30,17 @@ task:
     horizon: ${horizon}
     pad_before: ${eval:'${n_obs_steps}-1'}
     pad_after: ${eval:'${n_action_steps}-1'}
+    obs_keys: ${task.obs_keys}
+    abs_action: ${task.abs_action}
+    rotation_rep: rotation_6d
     seed: 42
     val_ratio: 0.02
+    # cross-embodiment training distribution (Stage 1/2)
+    k_feature_mode: virtual
+    # Stage 3
+    use_density_sampler: true
+    density_k_neighbors: 5
+    density_temperature: 1.0
 
     virtual_sampler:
       _target_: kc_dp.kinematics.virtual_sampler.VirtualRobotSampler
@@ -47,10 +57,12 @@ task:
   env_runner:
     _target_: diffusion_policy.env_runner.robomimic_lowdim_runner.RobomimicLowdimRunner
     dataset_path: ${task.dataset.dataset_path}
+    obs_keys: ${task.obs_keys}
+    abs_action: ${task.abs_action}
     n_train: 6
-    n_train_vis: 0
+    n_train_vis: 2
     n_test: 10
-    n_test_vis: 0
+    n_test_vis: 2
     max_steps: 400
     n_obs_steps: ${n_obs_steps}
     n_action_steps: ${n_action_steps}

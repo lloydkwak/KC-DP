@@ -1,6 +1,7 @@
 import os
 import torch
 import numpy as np
+import random
 from tqdm import tqdm
 import hydra
 from omegaconf import OmegaConf
@@ -42,6 +43,11 @@ def main(cfg):
     Iterates over the dataset to compute global mean and std for k(q) features.
     """
     print("Starting k(q) statistics computation with kinematic augmentation...")
+
+    seed = int(getattr(cfg.task.dataset, 'seed', 42))
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
     
     dataset = hydra.utils.instantiate(cfg.task.dataset)
     
@@ -57,10 +63,6 @@ def main(cfg):
     all_k_q = []
     
     for i in tqdm(range(num_samples), desc="Extracting k(q)"):
-        # Periodically clear the cache to ensure morphological diversity
-        if i % 100 == 0:
-            dataset.clear_epoch_cache()
-            
         item = dataset[i]
         
         # Extract the raw 42D k(q) vector appended at the end of the observation tensor

@@ -3,14 +3,17 @@ import torch
 import torch.nn as nn
 import h5py
 from typing import Dict, Any, Optional, Tuple
+import copy
 
 import pinocchio as pin
 
 from diffusion_policy.dataset.robomimic_replay_lowdim_dataset import (
     RobomimicReplayLowdimDataset,
 )
+from diffusion_policy.common.sampler import SequenceSampler
 from kc_dp.kinematics.feature_extractor import AnalyticKinematicModule
 from kc_dp.kinematics.virtual_sampler import VirtualRobotSampler
+from kc_dp.dataset.density_sampler import DensityWeightedSampler
 
 
 class HKMLowdimDataset(RobomimicReplayLowdimDataset):
@@ -29,6 +32,11 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         *args,
         virtual_sampler: Optional[VirtualRobotSampler] = None,
         base_kinematic_module: Optional[AnalyticKinematicModule] = None,
+        k_feature_mode: str = "base_physical",
+        use_density_sampler: bool = False,
+        density_k_neighbors: int = 5,
+        density_temperature: float = 1.0,
+        stats_path: str = "data/k_q_stats.pt",
         k_mean: Optional[Any] = None,
         k_std: Optional[Any] = None,
         **kwargs,
@@ -54,27 +62,46 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         # ── 3. HKM-specific attributes ──
         self.virtual_sampler = virtual_sampler
         self.base_kinematic_module = base_kinematic_module
+        self.k_feature_mode = k_feature_mode
+        self.use_density_sampler = use_density_sampler
+        self.density_k_neighbors = density_k_neighbors
+        self.density_temperature = density_temperature
 
         if self.virtual_sampler is None and self.base_kinematic_module is None:
             raise ValueError(
                 "Either virtual_sampler or base_kinematic_module must be provided."
             )
+        if self.k_feature_mode not in ("base_physical", "virtual"):
+            raise ValueError("k_feature_mode must be either 'base_physical' or 'virtual'.")
 
         # Type-safe tensor init (accepts list / ListConfig from Hydra)
+        stats = None
+        if (k_mean is None) or (k_std is None):
+            stats = torch.load(stats_path, map_location='cpu')
+
         if k_mean is not None:
-            self.k_mean = torch.from_numpy(
-                np.array(k_mean, dtype=np.float32)
-            ).float()
+            self.k_mean = torch.from_numpy(np.array(k_mean, dtype=np.float32)).float()
         else:
-            stats = torch.load('data/k_q_stats.pt', map_location='cpu'); self.k_mean = torch.as_tensor(stats['mean']).float()
+            self.k_mean = torch.as_tensor(stats['mean']).float()
 
         if k_std is not None:
-            self.k_std = torch.from_numpy(
-                np.array(k_std, dtype=np.float32)
-            ).float()
+            self.k_std = torch.from_numpy(np.array(k_std, dtype=np.float32)).float()
         else:
             self.k_std = torch.as_tensor(stats['std']).float()
         self.k_std = torch.clamp(self.k_std, min=1e-6)
+
+        if self.base_kinematic_module is not None:
+            idx = self.base_kinematic_module._arm_q_indices
+            self._base_q_min = np.where(
+                np.isinf(self.base_kinematic_module.model.lowerPositionLimit[idx]),
+                -2 * np.pi,
+                self.base_kinematic_module.model.lowerPositionLimit[idx],
+            ).astype(np.float64)
+            self._base_q_max = np.where(
+                np.isinf(self.base_kinematic_module.model.upperPositionLimit[idx]),
+                2 * np.pi,
+                self.base_kinematic_module.model.upperPositionLimit[idx],
+            ).astype(np.float64)
 
         # Virtual-module cache (cleared every epoch)
         self._vmodule_cache: Dict[
@@ -83,6 +110,7 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         self._build_episode_mapping()
 
         self._getitem_count = 0
+        self._density_sampler = None
 
     # ------------------------------------------------------------------
     # HDF5 re-read
@@ -126,6 +154,37 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
 
     def clear_epoch_cache(self):
         self._vmodule_cache.clear()
+        self._density_sampler = None
+
+    def get_train_sampler(self):
+        """
+        Stage 3 density-weighted sampling.
+        Returns None when disabled.
+        """
+        if not self.use_density_sampler:
+            return None
+        if self._density_sampler is None:
+            self._density_sampler = DensityWeightedSampler(
+                dataset=self,
+                kinematic_module=self.base_kinematic_module,
+                k_neighbors=self.density_k_neighbors,
+                temperature=self.density_temperature,
+            )
+        return self._density_sampler.get_sampler()
+
+    def get_validation_dataset(self):
+        val_set = copy.copy(self)
+        val_set.sampler = SequenceSampler(
+            replay_buffer=self.replay_buffer,
+            sequence_length=self.horizon,
+            pad_before=self.pad_before,
+            pad_after=self.pad_after,
+            episode_mask=~self.train_mask,
+        )
+        val_set.train_mask = ~self.train_mask
+        val_set.use_density_sampler = False
+        val_set._density_sampler = None
+        return val_set
 
     # ------------------------------------------------------------------
     # Virtual module creation (Stage 1 + 2)
@@ -141,15 +200,16 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
 
         if self.virtual_sampler is None:
             model = self.base_kinematic_module.model
+            idx = self.base_kinematic_module._arm_q_indices[:n_dof]
             q_min = np.where(
-                np.isinf(model.lowerPositionLimit[:n_dof]),
+                np.isinf(model.lowerPositionLimit[idx]),
                 -2 * np.pi,
-                model.lowerPositionLimit[:n_dof],
+                model.lowerPositionLimit[idx],
             )
             q_max = np.where(
-                np.isinf(model.upperPositionLimit[:n_dof]),
+                np.isinf(model.upperPositionLimit[idx]),
                 2 * np.pi,
-                model.upperPositionLimit[:n_dof],
+                model.upperPositionLimit[idx],
             )
             result = (self.base_kinematic_module, q_min, q_max)
             self._vmodule_cache[ep_idx] = result
@@ -278,10 +338,16 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         ep_idx = self.raw_to_ep[min(raw_start_idx, len(self.raw_to_ep) - 1)]
 
         # ── Compute k(q) ──
-        v_module, q_min_v, q_max_v = self._get_or_create_virtual_module(ep_idx)
-        k_q_np = v_module.compute_k_q_with_custom_limits(
-            q_window, q_min_v, q_max_v
-        )
+        if self.k_feature_mode == "base_physical":
+            n = q_window.shape[1]
+            k_q_np = self.base_kinematic_module.compute_k_q_with_custom_limits(
+                q_window, self._base_q_min[:n], self._base_q_max[:n]
+            )
+        else:
+            v_module, q_min_v, q_max_v = self._get_or_create_virtual_module(ep_idx)
+            k_q_np = v_module.compute_k_q_with_custom_limits(
+                q_window, q_min_v, q_max_v
+            )
 
         k_q = torch.from_numpy(k_q_np).float()
         k_q_normalized = (k_q - self.k_mean) / self.k_std

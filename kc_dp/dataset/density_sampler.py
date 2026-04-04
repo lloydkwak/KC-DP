@@ -42,22 +42,29 @@ class DensityWeightedSampler:
         
         n_dof = q_all.shape[1]
         
-        # Robust joint limit extraction from Pinocchio model
-        q_min_base = self.kinematic_module.model.lowerPositionLimit[:n_dof]
-        q_max_base = self.kinematic_module.model.upperPositionLimit[:n_dof]
+        # Robust arm-chain joint limit extraction from Pinocchio model
+        arm_idx = self.kinematic_module._arm_q_indices[:n_dof]
+        q_min_base = self.kinematic_module.model.lowerPositionLimit[arm_idx]
+        q_max_base = self.kinematic_module.model.upperPositionLimit[arm_idx]
         
         # Sanity check: Handle undefined limits (inf) by defaulting to [-2pi, 2pi]
         q_min_base = np.where(np.isinf(q_min_base), -2 * np.pi, q_min_base)
         q_max_base = np.where(np.isinf(q_max_base), 2 * np.pi, q_max_base)
         
         episode_means = []
-        for start, end in zip(starts, episode_ends):
+        for ep_idx, (start, end) in enumerate(zip(starts, episode_ends)):
             q_traj = q_all[start:end]
-            
-            # Compute k(q) trajectory
-            k_q_traj = self.kinematic_module.compute_k_q_with_custom_limits(
-                q_traj, q_min_base, q_max_base
-            )
+
+            # In virtual mode, use the same virtual module/limits as training feature generation.
+            if getattr(self.dataset, 'k_feature_mode', 'base_physical') == 'virtual' \
+                    and hasattr(self.dataset, '_get_or_create_virtual_module'):
+                v_module, q_min_v, q_max_v = self.dataset._get_or_create_virtual_module(ep_idx)
+                k_q_traj = v_module.compute_k_q_with_custom_limits(q_traj, q_min_v, q_max_v)
+            else:
+                # base_physical mode
+                k_q_traj = self.kinematic_module.compute_k_q_with_custom_limits(
+                    q_traj, q_min_base, q_max_base
+                )
             
             mean_k_q = np.mean(k_q_traj, axis=0)
             episode_means.append(mean_k_q)

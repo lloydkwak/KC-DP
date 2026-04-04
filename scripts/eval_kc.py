@@ -11,6 +11,7 @@ import click
 import torch
 import numpy as np
 import multiprocessing
+from kc_dp.kinematics.kq_feature import KQFeatureComputer
 
 try:
     multiprocessing.set_start_method('spawn', force=True)
@@ -40,8 +41,8 @@ ROBOT_REGISTRY = {
 TARGET_ROBOT = 'Panda'
 TARGET_TASK = None
 VANILLA_MODE = False
-_KM_CACHE = None
-_K_MEAN, _K_STD = np.zeros(42), np.ones(42)
+_KQ_COMP = None
+_EXPECTED_CONTROL_DELTA = None
 
 def normalize_gripper(grip_qpos, grip_open, grip_closed):
     range_q = grip_open - grip_closed
@@ -51,36 +52,11 @@ def normalize_gripper(grip_qpos, grip_open, grip_closed):
     panda_open, panda_closed = np.array([0.001, -0.001]), np.array([0.039, -0.039])
     return panda_closed + openness * (panda_open - panda_closed)
 
-# Insert this updated function into scripts/eval_kc.py
 def get_hkm_feature(q_pos):
-    global _KM_CACHE, _K_MEAN, _K_STD
-    km, q_min_base, q_max_base, n_joints = _KM_CACHE
+    global _KQ_COMP
+    n_joints = len(_KQ_COMP.q_min_base)
     q = np.asarray(q_pos)[:n_joints].astype(np.float64)
-    
-    # Force physical limits into the Virtual Sampler's 315-degree distribution bounds
-    max_range_rad = np.radians(315.0)
-    current_range = q_max_base - q_min_base
-    
-    q_min_eval = np.where(current_range > max_range_rad, q - (max_range_rad / 2), q_min_base)
-    q_max_eval = np.where(current_range > max_range_rad, q + (max_range_rad / 2), q_max_base)
-    
-    raw_kq = km.compute_k_q_with_custom_limits(q[np.newaxis], q_min_eval, q_max_eval)[0]
-    
-    if len(raw_kq) == 35:
-        periodic = raw_kq[:14]
-        vech_21 = raw_kq[14:]
-        M6 = np.zeros((6, 6))
-        idx = 0
-        for i in range(6):
-            for j in range(i, 6):
-                M6[i, j] = M6[j, i] = vech_21[idx]
-                idx += 1
-        M7 = np.zeros((7, 7))
-        M7[:6, :6] = M6
-        vech_28 = [M7[i, j] for i in range(7) for j in range(i, 7)]
-        raw_kq = np.concatenate([periodic, vech_28])
-        
-    return ((raw_kq - _K_MEAN) / _K_STD).astype(np.float32)
+    return _KQ_COMP.compute_normalized(q)
 
 import robomimic.utils.file_utils as FileUtils
 import robosuite
@@ -109,6 +85,17 @@ def patched_get_env_meta(dataset_path):
         mapped_task = task_map.get(TARGET_TASK.lower())
         if mapped_task:
             meta['env_name'] = mapped_task
+
+    ctrl_cfg = meta['env_kwargs'].get('controller_configs', {})
+    if isinstance(ctrl_cfg, dict) and (_EXPECTED_CONTROL_DELTA is not None):
+        cur = ctrl_cfg.get('control_delta', None)
+        if cur is not None and cur != _EXPECTED_CONTROL_DELTA:
+            print(
+                f"[WARN] controller control_delta mismatch: {cur} -> {_EXPECTED_CONTROL_DELTA}. "
+                "Forcing consistency with action representation."
+            )
+            ctrl_cfg['control_delta'] = _EXPECTED_CONTROL_DELTA
+            meta['env_kwargs']['controller_configs'] = ctrl_cfg
             
     meta['env_kwargs']['has_offscreen_renderer'] = True
     meta['env_kwargs']['has_renderer'] = False
@@ -165,7 +152,7 @@ RobomimicLowdimWrapper.step = patched_step
 @click.option('-n', '--n_test', default=50, help='Number of rollouts')
 @click.option('--no_kq', is_flag=True, help='Run in Vanilla DP mode')
 def main(checkpoint, output_dir, robot, task, n_test, no_kq):
-    global TARGET_ROBOT, TARGET_TASK, VANILLA_MODE, _KM_CACHE, _K_MEAN, _K_STD
+    global TARGET_ROBOT, TARGET_TASK, VANILLA_MODE, _KQ_COMP, _EXPECTED_CONTROL_DELTA
     TARGET_ROBOT = robot
     TARGET_TASK = task
     VANILLA_MODE = no_kq
@@ -176,18 +163,18 @@ def main(checkpoint, output_dir, robot, task, n_test, no_kq):
             print(f"\n[CRITICAL ERROR] '{stat_path}' not found!")
             sys.exit(1)
             
-        st = torch.load(stat_path, map_location='cpu')
-        _K_MEAN = np.array(st['mean'], dtype=np.float32)
-        _K_STD = np.clip(np.array(st['std'], dtype=np.float32), 1e-6, None)
-        print(f"\n[DEBUG] Successfully loaded k_q_stats! (Mean sum: {_K_MEAN.sum():.2f}, Std sum: {_K_STD.sum():.2f})")
-            
         cfg_r = ROBOT_REGISTRY[robot]
-        from kc_dp.kinematics.feature_extractor import AnalyticKinematicModule
-        km = AnalyticKinematicModule(urdf_path=os.path.join(_PROJECT_ROOT, cfg_r['urdf_path']), ee_frame_name=cfg_r['ee_frame'], max_dof=7)
-        idx = km._arm_q_indices[:cfg_r['n_arm_joints']]
-        q_min = np.where(np.isinf(km.model.lowerPositionLimit[idx]), -2*np.pi, km.model.lowerPositionLimit[idx]).astype(np.float64)
-        q_max = np.where(np.isinf(km.model.upperPositionLimit[idx]), 2*np.pi, km.model.upperPositionLimit[idx]).astype(np.float64)
-        _KM_CACHE = (km, q_min, q_max, cfg_r['n_arm_joints'])
+        _KQ_COMP = KQFeatureComputer(
+            urdf_path=os.path.join(_PROJECT_ROOT, cfg_r['urdf_path']),
+            ee_frame_name=cfg_r['ee_frame'],
+            max_dof=7,
+            stats_path=stat_path,
+            use_physical_limits=True,
+        )
+        print(
+            f"\n[DEBUG] Successfully loaded k_q_stats! "
+            f"(Mean sum: {_KQ_COMP.k_mean.sum():.2f}, Std sum: {_KQ_COMP.k_std.sum():.2f})"
+        )
 
     import dill
     import hydra
@@ -197,6 +184,8 @@ def main(checkpoint, output_dir, robot, task, n_test, no_kq):
 
     payload = torch.load(open(checkpoint, 'rb'), pickle_module=dill, map_location='cpu')
     cfg = payload['cfg']
+    abs_action = bool(getattr(cfg.task.env_runner, 'abs_action', getattr(cfg.task, 'abs_action', True)))
+    _EXPECTED_CONTROL_DELTA = (not abs_action)
     cfg.task.env_runner.n_test = n_test
     cfg.task.env_runner.n_test_vis = 5
     cfg.task.env_runner.n_train = 0
