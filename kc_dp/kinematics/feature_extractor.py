@@ -50,7 +50,7 @@ class AnalyticKinematicModule:
             raise ValueError(f"Frame '{ee_frame_name}' not found in the URDF.")
         self.ee_frame_id = self.model.getFrameId(ee_frame_name)
 
-        # ── 3. Identify arm-chain q-vector indices ──
+        # ── 3. Identify arm-chain q / v indices ──
         parent_jid = self.model.frames[self.ee_frame_id].parentJoint
         chain_jids = []
         while parent_jid > 0:
@@ -59,14 +59,20 @@ class AnalyticKinematicModule:
         chain_jids.reverse()
 
         self._arm_q_indices = []
+        self._arm_v_indices = []
         for jid in chain_jids:
             jnt = self.model.joints[jid]
             if jnt.nq > 0:
                 for k in range(jnt.nq):
                     self._arm_q_indices.append(jnt.idx_q + k)
+            if jnt.nv > 0:
+                for k in range(jnt.nv):
+                    self._arm_v_indices.append(jnt.idx_v + k)
         self._arm_q_indices = np.array(self._arm_q_indices, dtype=int)
+        self._arm_v_indices = np.array(self._arm_v_indices, dtype=int)
 
         self.n_arm_dof = len(self._arm_q_indices)
+        self.n_arm_vel_dof = len(self._arm_v_indices)
         self.n_model_q = self.model.nq
         self.max_dof = max_dof
 
@@ -84,7 +90,8 @@ class AnalyticKinematicModule:
     def _pad_q(self, q_arm: np.ndarray) -> np.ndarray:
         """Expand arm-only (n_arm_dof,) → full model config (n_model_q,)."""
         q_full = self._q_neutral.copy()
-        q_full[self._arm_q_indices[: len(q_arm)]] = q_arm
+        n_eff = min(len(q_arm), len(self._arm_q_indices))
+        q_full[self._arm_q_indices[:n_eff]] = q_arm[:n_eff]
         return q_full
 
     # ------------------------------------------------------------------
@@ -102,12 +109,16 @@ class AnalyticKinematicModule:
         T = q_sequence.shape[0]
         n_data = q_sequence.shape[1]
         k_q_out = np.zeros((T, 42))
+        n_eff = min(n_data, len(self._arm_q_indices), len(self._arm_v_indices))
+        if n_eff <= 0:
+            return k_q_out
 
-        range_q = np.maximum(q_max[:n_data] - q_min[:n_data], 1e-6)
+        range_q = np.maximum(q_max[:n_eff] - q_min[:n_eff], 1e-6)
 
         for t in range(T):
             q_arm = q_sequence[t]
-            q_full = self._pad_q(q_arm)
+            q_arm_eff = q_arm[:n_eff]
+            q_full = self._pad_q(q_arm_eff)
 
             pin.framesForwardKinematics(self.model, self.data, q_full)
             J_full = pin.computeFrameJacobian(
@@ -115,7 +126,7 @@ class AnalyticKinematicModule:
                 self.ee_frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
             )
             # Keep only arm-chain Jacobian columns
-            J = J_full[:, self._arm_q_indices[: n_data]]
+            J = J_full[:, self._arm_v_indices[:n_eff]]
 
             # ── 1. Range-weighted, L_char-normalized M* — 21D ──
             J_norm = self.S_matrix @ J
@@ -124,9 +135,9 @@ class AnalyticKinematicModule:
             m_star_vech = M_star[np.triu_indices(6)]
 
             # ── 2. Periodic joint encoding — 14D ──
-            q_normalized = 2.0 * np.pi * (q_arm - q_min[:n_data]) / range_q - np.pi
+            q_normalized = 2.0 * np.pi * (q_arm_eff - q_min[:n_eff]) / range_q - np.pi
             q_pad = np.zeros(self.max_dof)
-            q_pad[:n_data] = q_normalized
+            q_pad[:n_eff] = q_normalized
             periodic = np.concatenate([np.sin(q_pad), np.cos(q_pad)])
 
             # ── 3. L_char-normalized EE pose — 7D ──

@@ -7,6 +7,7 @@ Fixes Controller Gain Instability by preserving native dataset configs for Panda
 import os
 import sys
 import json
+import copy
 import click
 import torch
 import numpy as np
@@ -32,10 +33,34 @@ except Exception:
     pass
 
 ROBOT_REGISTRY = {
-    'Panda': {'urdf_path': 'data/urdf/franka_panda/urdf/panda.urdf', 'ee_frame': 'panda_link8', 'n_arm_joints': 7, 'grip_open': np.array([0.001, -0.001]), 'grip_closed': np.array([0.039, -0.039])},
-    'IIWA': {'urdf_path': 'data/urdf/kuka_iiwa/urdf/iiwa7.urdf', 'ee_frame': 'iiwa_link_7', 'n_arm_joints': 7, 'grip_open': np.array([0.49, 0.31, -0.36, -0.47, 0.04, -0.32]), 'grip_closed': np.array([0.01, 0.04, 0.06, -0.01, 0.02, 0.07])},
-    'Jaco': {'urdf_path': 'data/urdf/jaco/robots/kinova.urdf', 'ee_frame': 'j2n6s200_end_effector', 'n_arm_joints': 7, 'grip_open': np.array([0.60, 0.05, 0.60, 0.05, 0.60, 0.05]), 'grip_closed': np.array([0.75, 0.14, 0.75, 0.14, 0.75, 0.14])},
-    'UR5e': {'urdf_path': 'data/urdf/ur5/urdf/ur5_robot.urdf', 'ee_frame': 'ee_link', 'n_arm_joints': 6, 'grip_open': np.array([0.52, -0.10, 0.25, 0.51, -0.15, 0.26]), 'grip_closed': np.array([-0.02, -0.25, -0.21, -0.02, -0.25, -0.21])}
+    'Panda': {
+        'urdf_path': 'data/urdf/franka_panda/urdf/panda.urdf',
+        'ee_frame': 'panda_link8',
+        'n_arm_joints': 7,
+        'grip_open': np.array([0.001, -0.001]),
+        'grip_closed': np.array([0.039, -0.039])
+    },
+    'IIWA': {
+        'urdf_path': 'data/urdf/kuka_iiwa/urdf/iiwa7.urdf',
+        'ee_frame': 'lbr_iiwa_link_7', 
+        'n_arm_joints': 7,
+        'grip_open': np.array([0.49, 0.31, -0.36, -0.47, 0.04, -0.32]),
+        'grip_closed': np.array([0.01, 0.04, 0.06, -0.01, 0.02, 0.07])
+    },
+    'Jaco': {
+        'urdf_path': 'data/urdf/jaco/robots/kinova.urdf',
+        'ee_frame': 'j2s6s200_link_6',  
+        'n_arm_joints': 6,             
+        'grip_open': np.array([0.60, 0.05, 0.60, 0.05, 0.60, 0.05]),
+        'grip_closed': np.array([0.75, 0.14, 0.75, 0.14, 0.75, 0.14])
+    },
+    'UR5e': {
+        'urdf_path': 'data/urdf/ur5/urdf/ur5_robot.urdf',
+        'ee_frame': 'tool0',         
+        'n_arm_joints': 6,
+        'grip_open': np.array([0.52, -0.10, 0.25, 0.51, -0.15, 0.26]),
+        'grip_closed': np.array([-0.02, -0.25, -0.21, -0.02, -0.25, -0.21])
+    }
 }
 
 TARGET_ROBOT = 'Panda'
@@ -43,6 +68,9 @@ TARGET_TASK = None
 VANILLA_MODE = False
 _KQ_COMP = None
 _EXPECTED_CONTROL_DELTA = None
+_GRIPPER_DEBUG_PRINTED = False
+_GRIPPER_RANGE_STATE = {}
+_KQ_CLIP = 3.0
 
 def normalize_gripper(grip_qpos, grip_open, grip_closed):
     range_q = grip_open - grip_closed
@@ -52,32 +80,87 @@ def normalize_gripper(grip_qpos, grip_open, grip_closed):
     panda_open, panda_closed = np.array([0.001, -0.001]), np.array([0.039, -0.039])
     return panda_closed + openness * (panda_open - panda_closed)
 
+
+def normalize_gripper_adaptive(robot_name, grip_qpos, grip_open_seed, grip_closed_seed):
+    """
+    Normalize arbitrary robot gripper qpos to Panda 2D gripper space using
+    online min/max adaptation (robust to sign / scale mismatch across grippers).
+    """
+    q = np.asarray(grip_qpos, dtype=np.float64)
+
+    st = _GRIPPER_RANGE_STATE.get(robot_name)
+    if st is None:
+        seed_low = np.minimum(np.asarray(grip_open_seed, dtype=np.float64), np.asarray(grip_closed_seed, dtype=np.float64))
+        seed_high = np.maximum(np.asarray(grip_open_seed, dtype=np.float64), np.asarray(grip_closed_seed, dtype=np.float64))
+        st = {
+            'min': seed_low.copy(),
+            'max': seed_high.copy(),
+        }
+        _GRIPPER_RANGE_STATE[robot_name] = st
+
+    if q.shape == st['min'].shape:
+        st['min'] = np.minimum(st['min'], q)
+        st['max'] = np.maximum(st['max'], q)
+
+    denom = np.maximum(st['max'] - st['min'], 1e-6)
+    per_joint = np.clip((q - st['min']) / denom, 0.0, 1.0)
+    openness = float(np.mean(per_joint))
+
+    panda_open = np.array([0.001, -0.001], dtype=np.float64)
+    panda_closed = np.array([0.039, -0.039], dtype=np.float64)
+    mapped = panda_closed + openness * (panda_open - panda_closed)
+    return mapped.astype(np.float32)
+
 def get_hkm_feature(q_pos):
     global _KQ_COMP
     n_joints = len(_KQ_COMP.q_min_base)
     q = np.asarray(q_pos)[:n_joints].astype(np.float64)
-    return _KQ_COMP.compute_normalized(q)
+    k = _KQ_COMP.compute_normalized(q)
+    return np.clip(k, -_KQ_CLIP, _KQ_CLIP)
 
 import robomimic.utils.file_utils as FileUtils
 import robosuite
 
 _orig_get_env_meta = FileUtils.get_env_metadata_from_dataset
 
+
+def _build_controller_config(orig_cfg, target_robot):
+    """
+    Build controller config for target robot.
+    Avoid blindly reusing Panda-tuned gains on other robots.
+    """
+    default_cfg = robosuite.load_controller_config(default_controller="OSC_POSE")
+
+    # Start from target-agnostic default first (safer for cross-robot).
+    ctrl_cfg = copy.deepcopy(default_cfg)
+
+    # Keep only representation-critical keys from dataset config.
+    # Do not inherit Panda-specific gains / limits by default.
+    if isinstance(orig_cfg, dict):
+        passthrough_keys = [
+            'type',
+            'control_delta',
+            'interpolation',
+            'ramp_ratio',
+            'uncouple_pos_ori',
+        ]
+        for k in passthrough_keys:
+            if k in orig_cfg:
+                ctrl_cfg[k] = copy.deepcopy(orig_cfg[k])
+
+    # Critical for cross-robot: ensure robot identity is not stale Panda config.
+    ctrl_cfg['robot_name'] = target_robot
+    return ctrl_cfg
+
 def patched_get_env_meta(dataset_path):
     meta = _orig_get_env_meta(dataset_path)
-    
-    # [CRITICAL FIX] Panda일 때는 데이터셋의 튜닝된 제어기를 절대 건드리지 않습니다.
     if TARGET_ROBOT != 'Panda':
         meta['env_kwargs']['robots'] = [TARGET_ROBOT]
-        
-        # Cross-embodiment의 경우 새로운 기본 제어기를 로드하되, 데이터셋의 Delta 모드 설정은 계승합니다.
-        is_delta = True
+        # Prevent stale Panda gripper/controller bindings from dataset metadata.
+        meta['env_kwargs']['gripper_types'] = "default"
+
         orig_cfg = meta['env_kwargs'].get('controller_configs', {})
-        if isinstance(orig_cfg, dict) and 'control_delta' in orig_cfg:
-            is_delta = orig_cfg['control_delta']
-            
-        ctrl_config = robosuite.load_controller_config(default_controller="OSC_POSE")
-        ctrl_config['control_delta'] = is_delta
+        ctrl_config = _build_controller_config(orig_cfg, TARGET_ROBOT)
         meta['env_kwargs']['controller_configs'] = ctrl_config
         
     if TARGET_TASK is not None:
@@ -113,6 +196,7 @@ EnvUtils.create_env_from_metadata = patched_create_env
 from diffusion_policy.env.robomimic.robomimic_lowdim_wrapper import RobomimicLowdimWrapper
 
 def patched_get_obs(self):
+    global _GRIPPER_DEBUG_PRINTED
     cfg = ROBOT_REGISTRY[TARGET_ROBOT]
     raw_obs = self.env.get_observation()
     parts = []
@@ -121,11 +205,26 @@ def patched_get_obs(self):
         val = raw_obs[key]
         if key == 'robot0_gripper_qpos':
             val = np.asarray(val)
-            # Panda는 순정 그리퍼 값을 유지하고, 다른 로봇만 매핑합니다.
             if TARGET_ROBOT != 'Panda':
+                if not _GRIPPER_DEBUG_PRINTED:
+                    print(
+                        f"[DEBUG] {TARGET_ROBOT} raw robot0_gripper_qpos: "
+                        f"shape={val.shape}, min={val.min():.4f}, max={val.max():.4f}"
+                    )
+                    _GRIPPER_DEBUG_PRINTED = True
                 if val.shape != cfg['grip_open'].shape:
+                    print(
+                        f"[WARN] {TARGET_ROBOT} gripper shape mismatch: "
+                        f"obs={val.shape}, registry={cfg['grip_open'].shape}. "
+                        f"Using registry grip_open fallback."
+                    )
                     val = cfg['grip_open']
-                val = normalize_gripper(val, cfg['grip_open'], cfg['grip_closed'])
+                val = normalize_gripper_adaptive(
+                    TARGET_ROBOT,
+                    val,
+                    cfg['grip_open'],
+                    cfg['grip_closed'],
+                )
         parts.append(val)
         
     obs = np.concatenate(parts, axis=0).astype(np.float32)
@@ -152,13 +251,17 @@ RobomimicLowdimWrapper.step = patched_step
 @click.option('-n', '--n_test', default=50, help='Number of rollouts')
 @click.option('--no_kq', is_flag=True, help='Run in Vanilla DP mode')
 def main(checkpoint, output_dir, robot, task, n_test, no_kq):
-    global TARGET_ROBOT, TARGET_TASK, VANILLA_MODE, _KQ_COMP, _EXPECTED_CONTROL_DELTA
+    global TARGET_ROBOT, TARGET_TASK, VANILLA_MODE, _KQ_COMP, _EXPECTED_CONTROL_DELTA, _GRIPPER_RANGE_STATE, _GRIPPER_DEBUG_PRINTED
     TARGET_ROBOT = robot
     TARGET_TASK = task
     VANILLA_MODE = no_kq
+    _GRIPPER_RANGE_STATE = {}
+    _GRIPPER_DEBUG_PRINTED = False
     
     if not VANILLA_MODE:
-        stat_path = os.path.join(_PROJECT_ROOT, "data", "k_q_stats.pt")
+        virtual_stat_path = os.path.join(_PROJECT_ROOT, "data", "k_q_stats_virtual.pt")
+        base_stat_path = os.path.join(_PROJECT_ROOT, "data", "k_q_stats.pt")
+        stat_path = virtual_stat_path if os.path.exists(virtual_stat_path) else base_stat_path
         if not os.path.exists(stat_path):
             print(f"\n[CRITICAL ERROR] '{stat_path}' not found!")
             sys.exit(1)

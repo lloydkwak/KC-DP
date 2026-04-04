@@ -40,13 +40,21 @@ task:
     # Stage 3
     use_density_sampler: true
     density_k_neighbors: 5
-    density_temperature: 1.0
+    density_temperature: 0.7
+    density_max_weight_ratio: 4.0
+    k_clip_value: 3.0
+    stats_path: data/k_q_stats_virtual.pt
 
     virtual_sampler:
       _target_: kc_dp.kinematics.virtual_sampler.VirtualRobotSampler
       base_urdf_path: data/urdf/franka_panda/urdf/panda.urdf
       ee_frame_name: panda_link8
       max_dof: 7
+      stage1_min_range_deg: 60.0
+      stage1_max_range_deg: 300.0
+      stage2_log_sigma: 0.12
+      stage2_scale_min: 0.75
+      stage2_scale_max: 1.35
 
     base_kinematic_module:
       _target_: kc_dp.kinematics.feature_extractor.AnalyticKinematicModule

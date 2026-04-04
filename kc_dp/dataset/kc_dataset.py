@@ -36,9 +36,11 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         use_density_sampler: bool = False,
         density_k_neighbors: int = 5,
         density_temperature: float = 1.0,
+        density_max_weight_ratio: float = 5.0,
         stats_path: str = "data/k_q_stats.pt",
         k_mean: Optional[Any] = None,
         k_std: Optional[Any] = None,
+        k_clip_value: float = 3.0,
         **kwargs,
     ):
         kwargs.pop("zarr_path", None)
@@ -66,6 +68,8 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         self.use_density_sampler = use_density_sampler
         self.density_k_neighbors = density_k_neighbors
         self.density_temperature = density_temperature
+        self.density_max_weight_ratio = density_max_weight_ratio
+        self.k_clip_value = k_clip_value
 
         if self.virtual_sampler is None and self.base_kinematic_module is None:
             raise ValueError(
@@ -169,6 +173,7 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
                 kinematic_module=self.base_kinematic_module,
                 k_neighbors=self.density_k_neighbors,
                 temperature=self.density_temperature,
+                max_weight_ratio=self.density_max_weight_ratio,
             )
         return self._density_sampler.get_sampler()
 
@@ -248,8 +253,9 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
                 pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
             )
             # Use only arm-chain Jacobian columns
-            J_arm = J_full[:, self.base_kinematic_module._arm_q_indices[:q_traj_full.shape[1]]]
-            delta_pose_actual[t] = J_arm @ delta_q[t]
+            n_eff = min(q_traj_full.shape[1], len(self.base_kinematic_module._arm_v_indices))
+            J_arm = J_full[:, self.base_kinematic_module._arm_v_indices[:n_eff]]
+            delta_pose_actual[t] = J_arm @ delta_q[t][:n_eff]
 
         # Stage 1 + 2
         q_min_v, q_max_v = self.virtual_sampler.sample_stage1_limits(
@@ -351,6 +357,12 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
 
         k_q = torch.from_numpy(k_q_np).float()
         k_q_normalized = (k_q - self.k_mean) / self.k_std
+        if self.k_clip_value is not None:
+            k_q_normalized = torch.clamp(
+                k_q_normalized,
+                min=-float(self.k_clip_value),
+                max=float(self.k_clip_value),
+            )
 
         # ── Concatenate onto the unified obs tensor ──
         item["obs"] = torch.cat([item["obs"], k_q_normalized], dim=-1)

@@ -47,3 +47,7 @@ wandb/
 # Ignore wandb and other logs
 *.log
 EOF
+
+# Local analysis artifacts
+scripts/analyze_k_distribution.py
+data/eval_outputs/k_distribution_report*.json

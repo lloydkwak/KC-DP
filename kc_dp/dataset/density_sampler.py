@@ -19,7 +19,8 @@ class DensityWeightedSampler:
                  dataset: Any, 
                  kinematic_module: AnalyticKinematicModule, 
                  k_neighbors: int = 5, 
-                 temperature: float = 1.0):
+                 temperature: float = 1.0,
+                 max_weight_ratio: float = 5.0):
         """
         Initializes the density-weighted sampler and computes sampling weights.
         """
@@ -27,6 +28,7 @@ class DensityWeightedSampler:
         self.kinematic_module = kinematic_module
         self.k_neighbors = k_neighbors
         self.temperature = temperature
+        self.max_weight_ratio = max_weight_ratio
         
         self.episode_means = self._compute_episode_means()
         self.episode_weights = self._compute_gap_weights()
@@ -88,6 +90,13 @@ class DensityWeightedSampler:
         mean_distances = neighbor_dists.mean(dim=1).numpy()
         
         scaled_gaps = mean_distances * self.temperature
+
+        # Cap relative sample weight ratio to avoid over-focusing extreme outliers.
+        if (self.max_weight_ratio is not None) and (self.max_weight_ratio > 1.0):
+            g_max = float(np.max(scaled_gaps))
+            g_min_allowed = g_max - float(np.log(self.max_weight_ratio))
+            scaled_gaps = np.clip(scaled_gaps, g_min_allowed, g_max)
+
         exp_gaps = np.exp(scaled_gaps - np.max(scaled_gaps))
         probabilities = exp_gaps / np.sum(exp_gaps)
         

@@ -24,6 +24,11 @@ class VirtualRobotSampler:
         max_retries: int = 20,
         safety_margin: float = 0.05,
         violation_threshold: float = 0.05,
+        stage1_min_range_deg: float = 60.0,
+        stage1_max_range_deg: float = 300.0,
+        stage2_log_sigma: float = 0.15,
+        stage2_scale_min: float = 0.7,
+        stage2_scale_max: float = 1.4,
     ):
         self.base_urdf_path = base_urdf_path
         self.ee_frame_name = ee_frame_name
@@ -31,6 +36,11 @@ class VirtualRobotSampler:
         self.max_retries = max_retries
         self.safety_margin = safety_margin
         self.violation_threshold = violation_threshold
+        self.stage1_min_range_rad = np.radians(stage1_min_range_deg)
+        self.stage1_max_range_rad = np.radians(stage1_max_range_deg)
+        self.stage2_log_sigma = stage2_log_sigma
+        self.stage2_scale_min = stage2_scale_min
+        self.stage2_scale_max = stage2_scale_max
 
         with open(base_urdf_path, "r", encoding="utf-8") as f:
             self.base_urdf_str = f.read()
@@ -62,19 +72,20 @@ class VirtualRobotSampler:
     def sample_stage1_limits(
         self, q_traj_min: np.ndarray, q_traj_max: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        r_actual = q_traj_max - q_traj_min
-        min_range_rad = np.radians(60.0)
-        max_range_rad = np.radians(360.0) 
+        # Sample virtual limits as supersets of demonstrated limits.
+        # Keep a floor (for numerical stability in M*) and a ceiling
+        # (to reduce extreme over-expansion tails).
+        r_actual = np.maximum(q_traj_max - q_traj_min, 1e-6)
 
         q_min_v = np.zeros_like(q_traj_min)
         q_max_v = np.zeros_like(q_traj_max)
 
         for i in range(len(r_actual)):
-            lower_bound_r = max(r_actual[i], min_range_rad)
-            upper_bound_r = max(lower_bound_r, max_range_rad)
+            lower_bound_r = max(r_actual[i], self.stage1_min_range_rad)
+            upper_bound_r = max(lower_bound_r, self.stage1_max_range_rad)
             r_v = np.random.uniform(lower_bound_r, upper_bound_r)
             slack = r_v - r_actual[i]
-            slack_below = np.random.uniform(0.0, slack)
+            slack_below = np.random.uniform(0.0, max(slack, 0.0))
             q_min_v[i] = q_traj_min[i] - slack_below
             q_max_v[i] = q_min_v[i] + r_v
 
@@ -138,7 +149,8 @@ class VirtualRobotSampler:
                 pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
             )
             # Use only arm-chain columns
-            J = J_full[:, virtual_module._arm_q_indices[:n_data]]
+            n_eff = min(n_data, len(virtual_module._arm_v_indices))
+            J = J_full[:, virtual_module._arm_v_indices[:n_eff]]
 
             J_norm = virtual_module.S_matrix @ J
             dp_norm = virtual_module.S_matrix @ dp_t
@@ -165,8 +177,8 @@ class VirtualRobotSampler:
         n_dof = q_traj.shape[1]
 
         for _ in range(self.max_retries):
-            scales = np.random.lognormal(mean=0.0, sigma=0.4, size=n_dof)
-            scales = np.clip(scales, 0.3, 3.0)
+            scales = np.random.lognormal(mean=0.0, sigma=self.stage2_log_sigma, size=n_dof)
+            scales = np.clip(scales, self.stage2_scale_min, self.stage2_scale_max)
             modified_urdf_str = self._modify_urdf_in_memory(scales)
 
             try:
