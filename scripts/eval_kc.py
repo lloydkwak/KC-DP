@@ -7,6 +7,7 @@ Fixes Controller Gain Instability by preserving native dataset configs for Panda
 import os
 import sys
 import json
+import copy
 import click
 import torch
 import numpy as np
@@ -74,6 +75,89 @@ _USE_DOF_MASK = False
 _EXPECTED_OBS_DIM = None
 _DATASET_PATH_DEBUG_PRINTED = False
 _REF_L_CHAR = None
+_ROBOT_OSC_CONFIG_CACHE = {}
+_OSC_DEBUG_PRINTED = set()
+
+# Fallback OSC presets when robosuite controller loader is unavailable.
+# Keep action semantics aligned with robomimic low_dim defaults.
+_ROBOT_OSC_PRESETS = {
+    'Panda': {
+        'type': 'OSC_POSE',
+        'input_max': 1,
+        'input_min': -1,
+        'output_max': [0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
+        'output_min': [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5],
+        'kp': 150,
+        'damping_ratio': 1,
+        'impedance_mode': 'fixed',
+        'kp_limits': [0, 300],
+        'damping_ratio_limits': [0, 10],
+        'position_limits': None,
+        'orientation_limits': None,
+        'uncouple_pos_ori': True,
+        'input_type': 'delta',
+        'input_ref_frame': 'base',
+        'interpolation': None,
+        'ramp_ratio': 0.2,
+    },
+    'IIWA': {
+        'type': 'OSC_POSE',
+        'input_max': 1,
+        'input_min': -1,
+        'output_max': [0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
+        'output_min': [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5],
+        'kp': 150,
+        'damping_ratio': 1,
+        'impedance_mode': 'fixed',
+        'kp_limits': [0, 300],
+        'damping_ratio_limits': [0, 10],
+        'position_limits': None,
+        'orientation_limits': None,
+        'uncouple_pos_ori': True,
+        'input_type': 'delta',
+        'input_ref_frame': 'base',
+        'interpolation': None,
+        'ramp_ratio': 0.2,
+    },
+    'Jaco': {
+        'type': 'OSC_POSE',
+        'input_max': 1,
+        'input_min': -1,
+        'output_max': [0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
+        'output_min': [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5],
+        'kp': 150,
+        'damping_ratio': 1,
+        'impedance_mode': 'fixed',
+        'kp_limits': [0, 300],
+        'damping_ratio_limits': [0, 10],
+        'position_limits': None,
+        'orientation_limits': None,
+        'uncouple_pos_ori': True,
+        'input_type': 'delta',
+        'input_ref_frame': 'base',
+        'interpolation': None,
+        'ramp_ratio': 0.2,
+    },
+    'UR5e': {
+        'type': 'OSC_POSE',
+        'input_max': 1,
+        'input_min': -1,
+        'output_max': [0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
+        'output_min': [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5],
+        'kp': 150,
+        'damping_ratio': 1,
+        'impedance_mode': 'fixed',
+        'kp_limits': [0, 300],
+        'damping_ratio_limits': [0, 10],
+        'position_limits': None,
+        'orientation_limits': None,
+        'uncouple_pos_ori': True,
+        'input_type': 'delta',
+        'input_ref_frame': 'base',
+        'interpolation': None,
+        'ramp_ratio': 0.2,
+    },
+}
 
 
 def _resolve_dataset_path(dataset_path: str) -> str:
@@ -166,6 +250,95 @@ def _get_reference_l_char() -> float:
         _REF_L_CHAR = float(km.L_char)
     return _REF_L_CHAR
 
+
+def _extract_arm_controller_config(controller_cfg):
+    """Extract single-arm controller config dict from robosuite controller config variants."""
+    if not isinstance(controller_cfg, dict):
+        return None
+
+    # Legacy part-controller format
+    if 'type' in controller_cfg:
+        return copy.deepcopy(controller_cfg)
+
+    # New composite format
+    body_parts = controller_cfg.get('body_parts', {})
+    if isinstance(body_parts, dict):
+        # Flattened form: {"right": {...}, ...}
+        right = body_parts.get('right')
+        if isinstance(right, dict) and 'type' in right:
+            return copy.deepcopy(right)
+
+        # Nested arms form: {"arms": {"right": {...}}}
+        arms = body_parts.get('arms', {})
+        if isinstance(arms, dict):
+            right = arms.get('right')
+            if isinstance(right, dict) and 'type' in right:
+                return copy.deepcopy(right)
+
+    return None
+
+
+def _build_robot_specific_osc_config(robot_name: str, dataset_controller_cfg: dict) -> dict:
+    """Build robot-specific OSC_POSE controller config.
+
+    Priority:
+      1) robosuite robot default controller (if available)
+      2) dataset controller config
+      3) robosuite default OSC_POSE part config
+    """
+    if robot_name in _ROBOT_OSC_CONFIG_CACHE:
+        return copy.deepcopy(_ROBOT_OSC_CONFIG_CACHE[robot_name])
+
+    cfg = None
+    source = 'unknown'
+
+    # 1) Try robot-specific default controller config from robosuite.
+    try:
+        from robosuite.controllers import load_composite_controller_config
+
+        loaded = load_composite_controller_config(controller=None, robot=robot_name)
+        cfg = _extract_arm_controller_config(loaded)
+        if cfg is not None:
+            source = 'robosuite_default'
+    except Exception:
+        cfg = None
+
+    # 1.5) fallback preset from this repo
+    if cfg is None and robot_name in _ROBOT_OSC_PRESETS:
+        cfg = copy.deepcopy(_ROBOT_OSC_PRESETS[robot_name])
+        source = 'repo_fallback_preset'
+
+    # 2) Fallback to dataset controller config.
+    if cfg is None and isinstance(dataset_controller_cfg, dict):
+        cfg = copy.deepcopy(dataset_controller_cfg)
+        source = 'dataset_controller'
+
+    # 3) Final fallback to generic default OSC_POSE part config.
+    if cfg is None:
+        try:
+            from robosuite.controllers import load_part_controller_config
+
+            cfg = load_part_controller_config(default_controller='OSC_POSE')
+            source = 'robosuite_default_osc_pose'
+        except Exception:
+            cfg = {}
+            source = 'empty_default'
+
+    # Enforce OSC_POSE and preserve dataset action semantics when present.
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    cfg['type'] = 'OSC_POSE'
+
+    if isinstance(dataset_controller_cfg, dict):
+        for key in ['input_max', 'input_min', 'output_max', 'output_min', 'control_delta', 'interpolation', 'ramp_ratio']:
+            if key in dataset_controller_cfg and key not in cfg:
+                cfg[key] = copy.deepcopy(dataset_controller_cfg[key])
+
+    cfg['_kc_source'] = source
+    _ROBOT_OSC_CONFIG_CACHE[robot_name] = copy.deepcopy(cfg)
+    return cfg
+
 import robomimic.utils.file_utils as FileUtils
 
 _orig_get_env_meta = FileUtils.get_env_metadata_from_dataset
@@ -178,10 +351,22 @@ def patched_get_env_meta(dataset_path):
         _DATASET_PATH_DEBUG_PRINTED = True
 
     meta = _orig_get_env_meta(resolved_dataset_path)
-    if TARGET_ROBOT != 'Panda':
-        meta['env_kwargs']['robots'] = [TARGET_ROBOT]
-        # Keep dataset controller config as-is; only switch robot identity.
-        meta['env_kwargs']['gripper_types'] = "default"
+    env_kwargs = meta.setdefault('env_kwargs', {})
+    dataset_cc = env_kwargs.get('controller_configs', {})
+
+    # Always set target robot + robot-specific OSC controller.
+    env_kwargs['robots'] = [TARGET_ROBOT]
+    env_kwargs['gripper_types'] = "default"
+    env_kwargs['controller_configs'] = _build_robot_specific_osc_config(TARGET_ROBOT, dataset_cc)
+
+    if TARGET_ROBOT not in _OSC_DEBUG_PRINTED:
+        cc = env_kwargs.get('controller_configs', {})
+        print(
+            f"[INFO] Controller config for {TARGET_ROBOT}: "
+            f"type={cc.get('type')}, control_delta={cc.get('control_delta', None)}, "
+            f"kp={cc.get('kp', None)}, source={cc.get('_kc_source', 'unknown')}"
+        )
+        _OSC_DEBUG_PRINTED.add(TARGET_ROBOT)
         
     if TARGET_TASK is not None:
         task_map = {'can': 'PickPlaceCan', 'lift': 'Lift', 'square': 'NutAssemblySquare'}
@@ -189,8 +374,8 @@ def patched_get_env_meta(dataset_path):
         if mapped_task:
             meta['env_name'] = mapped_task
 
-    meta['env_kwargs']['has_offscreen_renderer'] = True
-    meta['env_kwargs']['has_renderer'] = False
+    env_kwargs['has_offscreen_renderer'] = True
+    env_kwargs['has_renderer'] = False
     return meta
 
 FileUtils.get_env_metadata_from_dataset = patched_get_env_meta

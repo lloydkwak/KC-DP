@@ -83,11 +83,13 @@ task:
     crf: 22
 
 policy:
-  _target_: diffusion_policy.policy.diffusion_unet_lowdim_policy.DiffusionUnetLowdimPolicy
+  _target_: kc_dp.policy.kc_unet.KCDiffusionUnetLowdimPolicy
+  base_obs_dim: ${task.obs_dim}
+  k_embed_dim: 16
   obs_dim: ${augmented_obs_dim}
   model:
     _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
-    global_cond_dim: ${eval:'${augmented_obs_dim} * ${n_obs_steps}'}
+    global_cond_dim: ${eval:'${task.obs_dim} * ${n_obs_steps} + ${policy.k_embed_dim}'}
 
 training:
   # Periodic cross-robot eval during training (videos saved under output_dir/cross_eval/)
