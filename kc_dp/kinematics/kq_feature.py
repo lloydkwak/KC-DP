@@ -7,6 +7,13 @@ import torch
 from kc_dp.kinematics.feature_extractor import AnalyticKinematicModule
 
 
+def _torch_load_compat(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 class KQFeatureComputer:
     """
     Shared k(q) feature computer used by dataset/train/eval.
@@ -43,7 +50,7 @@ class KQFeatureComputer:
                 self.k_mean = np.zeros(42, dtype=np.float32)
                 self.k_std = np.ones(42, dtype=np.float32)
             else:
-                st = torch.load(stats_path, map_location="cpu")
+                st = _torch_load_compat(stats_path)
                 self.k_mean = np.asarray(st["mean"], dtype=np.float32)
                 self.k_std = np.clip(np.asarray(st["std"], dtype=np.float32), 1e-6, None)
         else:

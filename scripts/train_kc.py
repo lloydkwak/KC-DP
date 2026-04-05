@@ -45,7 +45,11 @@ def _load_stats(path: str, key: str):
         path = os.path.join(_PROJECT_ROOT, path)
     if os.path.exists(path):
         try:
-            return torch.load(path, map_location="cpu")[key]
+            try:
+                st = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                st = torch.load(path, map_location="cpu")
+            return st[key]
         except Exception:
             pass
     return None
@@ -60,7 +64,11 @@ for _rname, _rfn in [("load_stats", _load_stats), ("eval", eval)]:
 # 2. Class-level Observation Patch
 # =====================================================================
 _URDF_PATH = os.path.join(_PROJECT_ROOT, "data", "urdf", "franka_panda", "urdf", "panda.urdf")
-_STATS_PATH = os.path.join(_PROJECT_ROOT, "data", "k_q_stats.pt")
+_STATS_PATH_MIX = os.path.join(_PROJECT_ROOT, "data", "k_q_stats_virtual_mix67.pt")
+_STATS_PATH_BASE = os.path.join(_PROJECT_ROOT, "data", "k_q_stats.pt")
+_STATS_PATH = _STATS_PATH_MIX if os.path.exists(_STATS_PATH_MIX) else _STATS_PATH_BASE
+_KQ_CLIP = 3.0
+_KQ_SCALE = 0.6
 
 def _compute_kq(q_pos: np.ndarray) -> np.ndarray:
     comp = get_pid_cached_kq_computer(
@@ -71,7 +79,9 @@ def _compute_kq(q_pos: np.ndarray) -> np.ndarray:
     )
     n = len(comp.q_min_base)
     q = q_pos[:n].astype(np.float64)
-    return comp.compute_normalized(q)
+    kq = comp.compute_normalized(q)
+    kq = np.clip(kq, -_KQ_CLIP, _KQ_CLIP)
+    return (kq * _KQ_SCALE).astype(np.float32)
 
 
 from diffusion_policy.env.robomimic.robomimic_lowdim_wrapper import (
@@ -81,11 +91,15 @@ from diffusion_policy.env.robomimic.robomimic_lowdim_wrapper import (
 _orig_get_obs = RobomimicLowdimWrapper.get_observation
 
 def _patched_get_observation(self):
-    obs = _orig_get_obs(self)
     raw_obs_dict = self.env.get_observation()
+    obs = np.concatenate([
+        raw_obs_dict[key] for key in self.obs_keys
+    ], axis=0)
     actual_q = raw_obs_dict['robot0_joint_pos']
     kq = _compute_kq(actual_q)
-    return np.concatenate([obs, kq])
+    # Training rollout env is Panda (7-DoF): use full dof mask ones.
+    dof_mask = np.ones(7, dtype=np.float32)
+    return np.concatenate([obs, kq, dof_mask])
 
 RobomimicLowdimWrapper.get_observation = _patched_get_observation
 

@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,6 +15,14 @@ from diffusion_policy.common.sampler import SequenceSampler
 from kc_dp.kinematics.feature_extractor import AnalyticKinematicModule
 from kc_dp.kinematics.virtual_sampler import VirtualRobotSampler
 from kc_dp.dataset.density_sampler import DensityWeightedSampler
+
+
+def _torch_load_compat(path: str):
+    """Load torch files compatibly across PyTorch versions (>=2.6 weights_only default)."""
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location='cpu')
 
 
 class HKMLowdimDataset(RobomimicReplayLowdimDataset):
@@ -41,6 +50,11 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         k_mean: Optional[Any] = None,
         k_std: Optional[Any] = None,
         k_clip_value: float = 3.0,
+        use_dof_mask: bool = False,
+        mixed_dof_augmentation: bool = False,
+        mixed_dof_prob_6d: float = 0.5,
+        k_feature_scale: float = 1.0,
+        k_dropout_prob: float = 0.0,
         **kwargs,
     ):
         kwargs.pop("zarr_path", None)
@@ -56,6 +70,14 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         if dataset_path is None:
             raise ValueError("dataset_path must be provided.")
 
+        dataset_path = self._resolve_dataset_path(str(dataset_path))
+
+        # super()에 전달되는 경로도 동기화
+        if args:
+            args = (dataset_path, *args[1:])
+        else:
+            kwargs["dataset_path"] = dataset_path
+
         super().__init__(*args, **kwargs)
 
         # ── 2. Re-read robot0_joint_pos from HDF5 and inject into buffer ──
@@ -70,6 +92,11 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         self.density_temperature = density_temperature
         self.density_max_weight_ratio = density_max_weight_ratio
         self.k_clip_value = k_clip_value
+        self.use_dof_mask = bool(use_dof_mask)
+        self.mixed_dof_augmentation = bool(mixed_dof_augmentation)
+        self.mixed_dof_prob_6d = float(np.clip(mixed_dof_prob_6d, 0.0, 1.0))
+        self.k_feature_scale = float(k_feature_scale)
+        self.k_dropout_prob = float(np.clip(k_dropout_prob, 0.0, 1.0))
 
         if self.virtual_sampler is None and self.base_kinematic_module is None:
             raise ValueError(
@@ -81,7 +108,7 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         # Type-safe tensor init (accepts list / ListConfig from Hydra)
         stats = None
         if (k_mean is None) or (k_std is None):
-            stats = torch.load(stats_path, map_location='cpu')
+            stats = _torch_load_compat(stats_path)
 
         if k_mean is not None:
             self.k_mean = torch.from_numpy(np.array(k_mean, dtype=np.float32)).float()
@@ -115,6 +142,41 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
 
         self._getitem_count = 0
         self._density_sampler = None
+
+    def _resolve_dataset_path(self, dataset_path: str) -> str:
+        """
+        Resolve dataset path robustly across host / docker layouts.
+        """
+        if os.path.exists(dataset_path):
+            return dataset_path
+
+        # Common fallback: avoid broken data/robomimic symlink by using local third_party path.
+        cand = dataset_path
+        if dataset_path.startswith("data/robomimic/"):
+            cand = dataset_path.replace("data/robomimic/", "third_party/diffusion_policy/data/robomimic/", 1)
+            if os.path.exists(cand):
+                return cand
+
+        # Try workspace-root anchored path
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        cand2 = os.path.join(project_root, dataset_path)
+        if os.path.exists(cand2):
+            return cand2
+
+        cand3 = os.path.join(
+            project_root,
+            "third_party",
+            "diffusion_policy",
+            "data",
+            "robomimic",
+            *dataset_path.split("data/robomimic/")[-1].split("/")
+        ) if "data/robomimic/" in dataset_path else ""
+        if cand3 and os.path.exists(cand3):
+            return cand3
+
+        raise FileNotFoundError(
+            f"Dataset not found: '{dataset_path}'. Tried fallback paths: '{cand}', '{cand2}', '{cand3}'."
+        )
 
     # ------------------------------------------------------------------
     # HDF5 re-read
@@ -160,6 +222,17 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         self._vmodule_cache.clear()
         self._density_sampler = None
 
+    def _sample_effective_dof(self, n_actual: int) -> int:
+        """
+        Sample effective DoF for mixed-embodiment augmentation.
+        Currently supports 7->6 down-mix to emulate 6-DoF embodiments.
+        """
+        if (not self.mixed_dof_augmentation) or (n_actual < 7):
+            return n_actual
+        if np.random.rand() < self.mixed_dof_prob_6d:
+            return 6
+        return min(7, n_actual)
+
     def get_train_sampler(self):
         """
         Stage 3 density-weighted sampling.
@@ -189,6 +262,9 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         val_set.train_mask = ~self.train_mask
         val_set.use_density_sampler = False
         val_set._density_sampler = None
+        # Keep validation deterministic and comparable across epochs.
+        val_set.mixed_dof_augmentation = False
+        val_set.k_dropout_prob = 0.0
         return val_set
 
     # ------------------------------------------------------------------
@@ -275,7 +351,9 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
 
     def get_normalizer(self, mode="limits", **kwargs):
         """
-        Expands the parent's obs normalizer by 42 identity-scaled dims for k(q).
+        Expands the parent's obs normalizer by:
+        - 42 dims for k(q)
+        - optional +7 dims for dof_mask
         """
         normalizer = super().get_normalizer(mode=mode, **kwargs)
         obs_params = normalizer["obs"].params_dict
@@ -283,23 +361,25 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         device = obs_params["offset"].device
         dtype = obs_params["offset"].dtype
 
+        extra_dim = 42 + (7 if self.use_dof_mask else 0)
+
         obs_params["offset"] = nn.Parameter(
             torch.cat(
-                [obs_params["offset"], torch.zeros(42, dtype=dtype, device=device)]
+                [obs_params["offset"], torch.zeros(extra_dim, dtype=dtype, device=device)]
             )
         )
         obs_params["scale"] = nn.Parameter(
             torch.cat(
-                [obs_params["scale"], torch.ones(42, dtype=dtype, device=device)]
+                [obs_params["scale"], torch.ones(extra_dim, dtype=dtype, device=device)]
             )
         )
 
         if "input_stats" in obs_params:
             stats = obs_params["input_stats"]
             for key in list(stats.keys()):
-                pad = torch.zeros(42, dtype=dtype, device=device)
+                pad = torch.zeros(extra_dim, dtype=dtype, device=device)
                 if key in ("std", "max"):
-                    pad = torch.ones(42, dtype=dtype, device=device)
+                    pad = torch.ones(extra_dim, dtype=dtype, device=device)
                 stats[key] = nn.Parameter(torch.cat([stats[key], pad]))
 
         return normalizer
@@ -344,15 +424,18 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
         ep_idx = self.raw_to_ep[min(raw_start_idx, len(self.raw_to_ep) - 1)]
 
         # ── Compute k(q) ──
+        n_actual = q_window.shape[1]
+        n_eff = self._sample_effective_dof(n_actual)
+        q_used = q_window[:, :n_eff]
+
         if self.k_feature_mode == "base_physical":
-            n = q_window.shape[1]
             k_q_np = self.base_kinematic_module.compute_k_q_with_custom_limits(
-                q_window, self._base_q_min[:n], self._base_q_max[:n]
+                q_used, self._base_q_min[:n_eff], self._base_q_max[:n_eff]
             )
         else:
             v_module, q_min_v, q_max_v = self._get_or_create_virtual_module(ep_idx)
             k_q_np = v_module.compute_k_q_with_custom_limits(
-                q_window, q_min_v, q_max_v
+                q_used, q_min_v[:n_eff], q_max_v[:n_eff]
             )
 
         k_q = torch.from_numpy(k_q_np).float()
@@ -363,9 +446,18 @@ class HKMLowdimDataset(RobomimicReplayLowdimDataset):
                 min=-float(self.k_clip_value),
                 max=float(self.k_clip_value),
             )
+        if self.k_feature_scale != 1.0:
+            k_q_normalized = k_q_normalized * float(self.k_feature_scale)
+        if self.k_dropout_prob > 0.0 and (np.random.rand() < self.k_dropout_prob):
+            k_q_normalized = torch.zeros_like(k_q_normalized)
 
         # ── Concatenate onto the unified obs tensor ──
-        item["obs"] = torch.cat([item["obs"], k_q_normalized], dim=-1)
+        if self.use_dof_mask:
+            dof_mask = torch.zeros((k_q_normalized.shape[0], 7), dtype=k_q_normalized.dtype)
+            dof_mask[:, : min(n_eff, 7)] = 1.0
+            item["obs"] = torch.cat([item["obs"], k_q_normalized, dof_mask], dim=-1)
+        else:
+            item["obs"] = torch.cat([item["obs"], k_q_normalized], dim=-1)
 
         item.pop("robot0_joint_pos", None)
 

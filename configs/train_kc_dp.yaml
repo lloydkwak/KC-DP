@@ -16,8 +16,8 @@ horizon: 16
 n_obs_steps: 2
 n_action_steps: 8
 
-# Augmented obs = base obs (e.g. 23 for can) + k(q) (42)
-augmented_obs_dim: ${eval:'${task.obs_dim} + 42'}
+# Augmented obs = base obs (e.g. 23 for can) + k(q) (42) + dof_mask (7)
+augmented_obs_dim: ${eval:'${task.obs_dim} + 49'}
 
 # Override workspace-level obs_dim so policy.obs_dim, normalizer, etc.
 # all see the augmented dimension instead of the base task.obs_dim.
@@ -26,7 +26,7 @@ obs_dim: ${augmented_obs_dim}
 task:
   dataset:
     _target_: kc_dp.dataset.kc_dataset.HKMLowdimDataset
-    dataset_path: data/robomimic/datasets/can/ph/low_dim_abs.hdf5
+    dataset_path: third_party/diffusion_policy/data/robomimic/datasets/can/ph/low_dim_abs.hdf5
     horizon: ${horizon}
     pad_before: ${eval:'${n_obs_steps}-1'}
     pad_after: ${eval:'${n_action_steps}-1'}
@@ -37,13 +37,18 @@ task:
     val_ratio: 0.02
     # cross-embodiment training distribution (Stage 1/2)
     k_feature_mode: virtual
+    use_dof_mask: true
+    mixed_dof_augmentation: true
+    mixed_dof_prob_6d: 0.5
     # Stage 3
     use_density_sampler: true
     density_k_neighbors: 5
     density_temperature: 0.7
     density_max_weight_ratio: 4.0
     k_clip_value: 3.0
-    stats_path: data/k_q_stats_virtual.pt
+    k_feature_scale: 0.6
+    k_dropout_prob: 0.15
+    stats_path: data/k_q_stats_virtual_mix67.pt
 
     virtual_sampler:
       _target_: kc_dp.kinematics.virtual_sampler.VirtualRobotSampler
@@ -83,3 +88,12 @@ policy:
   model:
     _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
     global_cond_dim: ${eval:'${augmented_obs_dim} * ${n_obs_steps}'}
+
+training:
+  # Periodic cross-robot eval during training (videos saved under output_dir/cross_eval/)
+  cross_eval_enable: true
+  cross_eval_every: 50
+  cross_eval_robots: [Panda, IIWA, Jaco, UR5e]
+  cross_eval_n_test: 3
+  cross_eval_no_kq: false
+  cross_eval_keep_checkpoint: false

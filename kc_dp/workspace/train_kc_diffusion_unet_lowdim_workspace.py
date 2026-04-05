@@ -1,4 +1,8 @@
 import os
+import sys
+import json
+import subprocess
+from pathlib import Path
 import hydra
 import torch
 from omegaconf import OmegaConf
@@ -66,6 +70,85 @@ class TrainKCDiffusionUnetLowdimWorkspace(BaseWorkspace):
             raise ValueError(
                 f"dataset_path points to delta-action file ({dataset_path}) but abs_action=True."
             )
+
+    def _run_cross_robot_eval(self, cfg: OmegaConf, checkpoint_path: str) -> dict:
+        """
+        Optional periodic cross-robot eval during training.
+        Uses scripts/eval_kc.py and stores videos under output_dir/cross_eval/.
+        """
+        tcfg = cfg.training
+        if not bool(getattr(tcfg, 'cross_eval_enable', False)):
+            return {}
+
+        every = int(getattr(tcfg, 'cross_eval_every', 0))
+        if every <= 0 or (self.epoch % every) != 0:
+            return {}
+
+        robots = list(getattr(tcfg, 'cross_eval_robots', []))
+        if len(robots) == 0:
+            return {}
+
+        n_test = int(getattr(tcfg, 'cross_eval_n_test', 10))
+        no_kq = bool(getattr(tcfg, 'cross_eval_no_kq', False))
+        keep_ckpt = bool(getattr(tcfg, 'cross_eval_keep_checkpoint', False))
+
+        project_root = Path(__file__).resolve().parents[2]
+        eval_script = project_root / 'scripts' / 'eval_kc.py'
+
+        if not eval_script.exists():
+            print(f"[WARN] cross_eval skipped. eval script not found: {eval_script}")
+            return {}
+
+        env = os.environ.copy()
+        py_path_prefix = f"{project_root}:{project_root / 'third_party' / 'diffusion_policy'}"
+        env['PYTHONPATH'] = py_path_prefix if not env.get('PYTHONPATH') else f"{py_path_prefix}:{env['PYTHONPATH']}"
+
+        metrics = {}
+        for robot in robots:
+            out_dir = Path(self.output_dir) / 'cross_eval' / f'epoch_{self.epoch:04d}' / str(robot)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                sys.executable,
+                str(eval_script),
+                '-c', str(checkpoint_path),
+                '-o', str(out_dir),
+                '-r', str(robot),
+                '-n', str(n_test),
+            ]
+            if no_kq:
+                cmd.append('--no_kq')
+
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(project_root),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=True,
+                )
+                eval_log = out_dir / 'eval_log.json'
+                if eval_log.exists():
+                    with open(eval_log, 'r', encoding='utf-8') as f:
+                        d = json.load(f)
+                    score = float(d.get('test/mean_score', 0.0))
+                    metrics[f'cross_eval/{robot}/mean_score'] = score
+                else:
+                    metrics[f'cross_eval/{robot}/mean_score'] = 0.0
+                print(f"[cross_eval] {robot} done. output={out_dir}")
+            except Exception as e:
+                metrics[f'cross_eval/{robot}/error'] = 1.0
+                print(f"[WARN] cross_eval failed for {robot}: {e}")
+
+        if not keep_ckpt:
+            try:
+                os.remove(checkpoint_path)
+            except Exception:
+                pass
+
+        return metrics
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -254,6 +337,22 @@ class TrainKCDiffusionUnetLowdimWorkspace(BaseWorkspace):
                     topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
                     if topk_ckpt_path is not None:
                         self.save_checkpoint(path=topk_ckpt_path)
+
+                # Optional: cross-robot eval videos/metrics during training.
+                # Save a temporary checkpoint for eval_kc.py, then run selected robots.
+                cross_eval_enable = bool(getattr(cfg.training, 'cross_eval_enable', False))
+                cross_eval_every = int(getattr(cfg.training, 'cross_eval_every', 0))
+                if cross_eval_enable and cross_eval_every > 0 and (self.epoch % cross_eval_every) == 0:
+                    tmp_ckpt_path = os.path.join(
+                        self.output_dir,
+                        'checkpoints',
+                        f'cross_eval_epoch_{self.epoch:04d}.ckpt'
+                    )
+                    os.makedirs(os.path.dirname(tmp_ckpt_path), exist_ok=True)
+                    self.save_checkpoint(path=tmp_ckpt_path)
+                    cross_metrics = self._run_cross_robot_eval(cfg, tmp_ckpt_path)
+                    if len(cross_metrics) > 0:
+                        step_log.update(cross_metrics)
 
                 policy.train()
 
