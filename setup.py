@@ -2,9 +2,9 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="kc_dp",
+    name="remotebot",
     version="0.1.0",
-    description="Kinematics-Conditioned Diffusion Policy for Cross-Embodiment Robot Manipulation",
+    description="RemoteBot: Task-space diffusion policy with feasibility-guided denoising",
     author="Your Name/Lab",
     author_email="your.email@example.com",
     packages=find_packages(),
@@ -13,8 +13,10 @@ setup(
         # Core mathematical and deep learning libraries
         "numpy",
         "torch",
-        # High-performance rigid body kinematics library
+    # Legacy rigid body kinematics library
         "pinocchio",
+    # Differentiable kinematics for feasibility guidance
+    "pytorch-kinematics",
         # Configuration management (strictly required for our custom dataset/policy wrappers)
         "hydra-core",
         "omegaconf"

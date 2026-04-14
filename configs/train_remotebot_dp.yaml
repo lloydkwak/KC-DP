@@ -1,0 +1,63 @@
+# configs/train_remotebot_dp.yaml
+
+hydra:
+  searchpath:
+    - file://third_party/diffusion_policy/diffusion_policy/config
+
+defaults:
+  - train_diffusion_unet_lowdim_workspace
+  - override /task: can_lowdim_abs
+  - _self_
+
+name: train_remotebot_dp_lowdim
+_target_: remotebot.training.train_remotebot_diffusion_unet_lowdim_workspace.TrainRemoteBotDiffusionUnetLowdimWorkspace
+n_latency_steps: 0
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+
+obs_dim: ${task.obs_dim}
+
+task:
+  dataset:
+    _target_: remotebot.dataset.taskspace_dataset.TaskSpaceLowdimDataset
+    dataset_path: third_party/diffusion_policy/data/robomimic/datasets/can/ph/low_dim_abs.hdf5
+    horizon: ${horizon}
+    pad_before: ${eval:'${n_obs_steps}-1'}
+    pad_after: ${eval:'${n_action_steps}-1'}
+    obs_keys: ${task.obs_keys}
+    abs_action: ${task.abs_action}
+    rotation_rep: rotation_6d
+    seed: 42
+    val_ratio: 0.02
+
+  env_runner:
+    _target_: diffusion_policy.env_runner.robomimic_lowdim_runner.RobomimicLowdimRunner
+    dataset_path: ${task.dataset.dataset_path}
+    obs_keys: ${task.obs_keys}
+    abs_action: ${task.abs_action}
+    n_train: 6
+    n_train_vis: 2
+    n_test: 10
+    n_test_vis: 2
+    max_steps: 400
+    n_obs_steps: ${n_obs_steps}
+    n_action_steps: ${n_action_steps}
+    fps: 10
+    crf: 22
+
+policy:
+  _target_: remotebot.policy.remotebot_unet.RemoteBotDiffusionUnetLowdimPolicy
+  obs_dim: ${task.obs_dim}
+  guidance_weight_base: 0.0
+  guidance_power: 2.0
+  model:
+    _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
+    global_cond_dim: ${eval:'${task.obs_dim} * ${n_obs_steps}'}
+
+training:
+  cross_eval_enable: true
+  cross_eval_every: 50
+  cross_eval_robots: [Panda, IIWA, Jaco, UR5e]
+  cross_eval_n_test: 3
+  cross_eval_keep_checkpoint: false

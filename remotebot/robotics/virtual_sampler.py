@@ -3,11 +3,10 @@ import xml.etree.ElementTree as ET
 from typing import Tuple
 
 import pinocchio as pin
-from kc_dp.kinematics.feature_extractor import (
+from .feature_extractor import (
     AnalyticKinematicModule,
     _build_model_from_xml_string,
 )
-
 
 class VirtualRobotSampler:
     """

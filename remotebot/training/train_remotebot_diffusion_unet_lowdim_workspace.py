@@ -24,7 +24,7 @@ from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusers.training_utils import EMAModel
 
 
-class TrainKCDiffusionUnetLowdimWorkspace(BaseWorkspace):
+class TrainRemoteBotDiffusionUnetLowdimWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
@@ -74,7 +74,7 @@ class TrainKCDiffusionUnetLowdimWorkspace(BaseWorkspace):
     def _run_cross_robot_eval(self, cfg: OmegaConf, checkpoint_path: str) -> dict:
         """
         Optional periodic cross-robot eval during training.
-        Uses scripts/eval_kc.py and stores videos under output_dir/cross_eval/.
+        Uses scripts/eval_remotebot.py and stores videos under output_dir/cross_eval/.
         """
         tcfg = cfg.training
         if not bool(getattr(tcfg, 'cross_eval_enable', False)):
@@ -89,11 +89,10 @@ class TrainKCDiffusionUnetLowdimWorkspace(BaseWorkspace):
             return {}
 
         n_test = int(getattr(tcfg, 'cross_eval_n_test', 10))
-        no_kq = bool(getattr(tcfg, 'cross_eval_no_kq', False))
         keep_ckpt = bool(getattr(tcfg, 'cross_eval_keep_checkpoint', False))
 
         project_root = Path(__file__).resolve().parents[2]
-        eval_script = project_root / 'scripts' / 'eval_kc.py'
+        eval_script = project_root / 'scripts' / 'eval_remotebot.py'
 
         if not eval_script.exists():
             print(f"[WARN] cross_eval skipped. eval script not found: {eval_script}")
@@ -116,9 +115,6 @@ class TrainKCDiffusionUnetLowdimWorkspace(BaseWorkspace):
                 '-r', str(robot),
                 '-n', str(n_test),
             ]
-            if no_kq:
-                cmd.append('--no_kq')
-
             try:
                 proc = subprocess.run(
                     cmd,

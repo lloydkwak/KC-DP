@@ -10,6 +10,9 @@ scipy
 # ==========================================
 # Kinematics & Robotics
 # ==========================================
+# Differentiable kinematics backend for feasibility-guided diffusion
+pytorch-kinematics
+# Legacy dependency kept for compatibility with existing virtual sampler utilities
 # Pinocchio for lightning-fast Jacobian and forward kinematics
 pinocchio
 
