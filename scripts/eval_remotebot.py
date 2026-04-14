@@ -413,7 +413,7 @@ RobomimicLowdimWrapper.step = patched_step
 @click.option("-r", "--robot", default="Panda", help="Eval Robot (Panda, IIWA, Jaco, UR5e)")
 @click.option("-t", "--task", default=None, help="Override Task")
 @click.option("-n", "--n_test", default=50, help="Number of rollouts")
-@click.option("--guidance_weight", default=1.0, type=float, help="Feasibility guidance base weight (0 to disable)")
+@click.option("--guidance_weight", default=0.0, type=float, help="Feasibility guidance base weight (0 to disable)")
 @click.option("--lock_joint", default=None, type=str, help="Optional joint fault lock as 'joint_idx:value'")
 def main(checkpoint, output_dir, robot, task, n_test, guidance_weight, lock_joint):
     global TARGET_ROBOT, TARGET_TASK, _GRIPPER_DEBUG_PRINTED

@@ -16,6 +16,14 @@ class FeasibilityOracle:
 
     The IK solve is intentionally run in `no_grad` for stability, while the
     final residual term remains differentiable w.r.t. target trajectory.
+
+        NOTE (gradient semantics):
+        - `c_ik` and `c_workspace` provide direct gradients to denoising guidance.
+        - `c_joint_limit` and joint `c_smooth/c_jerk` are computed from IK output
+            solved under `no_grad`, so they mainly act as monitoring/regularization
+            indicators in the current implementation.
+        - For full end-to-end joint-cost gradients, implicit differentiation over
+            the IK solver would be required.
     """
 
     def __init__(

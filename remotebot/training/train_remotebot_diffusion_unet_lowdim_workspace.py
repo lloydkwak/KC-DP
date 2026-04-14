@@ -89,6 +89,7 @@ class TrainRemoteBotDiffusionUnetLowdimWorkspace(BaseWorkspace):
             return {}
 
         n_test = int(getattr(tcfg, 'cross_eval_n_test', 10))
+        guidance_weight = float(getattr(tcfg, 'cross_eval_guidance_weight', 0.0))
         keep_ckpt = bool(getattr(tcfg, 'cross_eval_keep_checkpoint', False))
 
         project_root = Path(__file__).resolve().parents[2]
@@ -99,8 +100,11 @@ class TrainRemoteBotDiffusionUnetLowdimWorkspace(BaseWorkspace):
             return {}
 
         env = os.environ.copy()
-        py_path_prefix = f"{project_root}:{project_root / 'third_party' / 'diffusion_policy'}"
-        env['PYTHONPATH'] = py_path_prefix if not env.get('PYTHONPATH') else f"{py_path_prefix}:{env['PYTHONPATH']}"
+        py_path_prefix = os.pathsep.join([
+            str(project_root),
+            str(project_root / 'third_party' / 'diffusion_policy')
+        ])
+        env['PYTHONPATH'] = py_path_prefix if not env.get('PYTHONPATH') else f"{py_path_prefix}{os.pathsep}{env['PYTHONPATH']}"
 
         metrics = {}
         for robot in robots:
@@ -114,6 +118,7 @@ class TrainRemoteBotDiffusionUnetLowdimWorkspace(BaseWorkspace):
                 '-o', str(out_dir),
                 '-r', str(robot),
                 '-n', str(n_test),
+                '--guidance_weight', str(guidance_weight),
             ]
             try:
                 proc = subprocess.run(

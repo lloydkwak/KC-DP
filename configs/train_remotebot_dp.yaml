@@ -22,6 +22,7 @@ task:
   dataset:
     _target_: remotebot.dataset.taskspace_dataset.TaskSpaceLowdimDataset
     dataset_path: third_party/diffusion_policy/data/robomimic/datasets/can/ph/low_dim_abs.hdf5
+    action_mode: obs_abs_axis_angle
     horizon: ${horizon}
     pad_before: ${eval:'${n_obs_steps}-1'}
     pad_after: ${eval:'${n_action_steps}-1'}
@@ -58,6 +59,7 @@ policy:
 training:
   cross_eval_enable: true
   cross_eval_every: 50
+  cross_eval_guidance_weight: 0.0
   cross_eval_robots: [Panda, IIWA, Jaco, UR5e]
   cross_eval_n_test: 3
   cross_eval_keep_checkpoint: false
