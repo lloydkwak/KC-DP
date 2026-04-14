@@ -15,7 +15,6 @@ import numpy as np
 
 from remotebot.tstd import (
     diversify_approach,
-    diversify_path,
     extract_pickplace_keypoints,
     sample_diverse_grasps,
 )
@@ -130,6 +129,169 @@ def _compose_action_from_pose(pos: np.ndarray, quat: np.ndarray, gripper: np.nda
     return np.concatenate([pos, aa, g.astype(np.float32)], axis=-1)
 
 
+def interpolate_segment_pos(
+    start_pos: np.ndarray,
+    end_pos: np.ndarray,
+    n_steps: int,
+    mode: str = "linear",
+    via_point: np.ndarray = None,
+) -> np.ndarray:
+    """
+    Interpolate segment positions with n_steps samples (including endpoints).
+    """
+    n_steps = int(max(2, n_steps))
+    t = np.linspace(0.0, 1.0, n_steps, dtype=np.float32)
+
+    if mode == "bezier":
+        if via_point is None:
+            via_point = 0.5 * (start_pos + end_pos)
+        p0 = start_pos.astype(np.float32)
+        p1 = via_point.astype(np.float32)
+        p2 = end_pos.astype(np.float32)
+        return (
+            ((1.0 - t) ** 2)[:, None] * p0[None, :]
+            + (2.0 * (1.0 - t) * t)[:, None] * p1[None, :]
+            + (t**2)[:, None] * p2[None, :]
+        ).astype(np.float32)
+
+    return np.linspace(start_pos, end_pos, n_steps, dtype=np.float32)
+
+
+def interpolate_segment_quat(start_quat: np.ndarray, end_quat: np.ndarray, n_steps: int) -> np.ndarray:
+    """
+    Interpolate segment orientations with Slerp using n_steps samples (including endpoints).
+    """
+    n_steps = int(max(2, n_steps))
+    out = np.zeros((n_steps, 4), dtype=np.float32)
+    for i in range(n_steps):
+        alpha = float(i) / float(max(1, n_steps - 1))
+        out[i] = _quat_slerp(start_quat, end_quat, alpha)
+    return out
+
+
+def _allocate_segment_steps_from_ratios(T: int, anchor_indices: List[int]) -> List[int]:
+    """
+    Allocate segment lengths (in intervals) by preserving original keypoint interval ratios.
+    Sum(seg_steps) == T-1.
+    """
+    total_intervals = int(max(1, T - 1))
+    spans = np.diff(np.asarray(anchor_indices, dtype=np.int64))
+    spans = np.maximum(spans, 1)
+
+    weights = spans.astype(np.float64) / float(np.sum(spans))
+    raw = weights * float(total_intervals)
+    seg_steps = np.floor(raw).astype(np.int64)
+    seg_steps = np.maximum(seg_steps, 1)
+
+    diff = int(total_intervals - int(np.sum(seg_steps)))
+    if diff != 0:
+        frac = raw - np.floor(raw)
+        order = np.argsort(-frac if diff > 0 else frac)
+        idx = 0
+        while diff != 0 and idx < len(order) * 4:
+            j = int(order[idx % len(order)])
+            if diff > 0:
+                seg_steps[j] += 1
+                diff -= 1
+            else:
+                if seg_steps[j] > 1:
+                    seg_steps[j] -= 1
+                    diff += 1
+            idx += 1
+
+    return seg_steps.tolist()
+
+
+def build_full_trajectory(
+    keypoints: Dict[str, Dict[str, np.ndarray]],
+    step_allocation: Dict[str, int],
+    T: int,
+    pos_ref: np.ndarray,
+    quat_ref: np.ndarray,
+) -> (np.ndarray, np.ndarray):
+    """
+    Build a full T-step trajectory by stitching keypoint-to-keypoint segments.
+    """
+    segment_order = [
+        ("start", "approach", "start_to_approach"),
+        ("approach", "grasp", "approach_to_grasp"),
+        ("grasp", "lift_peak", "grasp_to_lift"),
+        ("lift_peak", "place", "lift_to_place"),
+        ("place", "end", "place_to_end"),
+    ]
+
+    pos_chunks = []
+    quat_chunks = []
+
+    for i, (k0, k1, seg_name) in enumerate(segment_order):
+        n_interval = int(max(1, step_allocation.get(seg_name, 1)))
+        n_samples = n_interval + 1
+
+        i0 = int(keypoints[k0]["idx"])
+        i1 = int(keypoints[k1]["idx"])
+
+        if seg_name == "start_to_approach":
+            p0 = keypoints[k0]["pos"]
+            p1 = keypoints[k1]["pos"]
+            via = 0.5 * (p0 + p1)
+            via[2] += 0.02
+            seg_pos = interpolate_segment_pos(p0, p1, n_samples, mode="bezier", via_point=via)
+            seg_quat = interpolate_segment_quat(keypoints[k0]["quat"], keypoints[k1]["quat"], n_samples)
+        elif seg_name == "approach_to_grasp":
+            seg_pos = interpolate_segment_pos(
+                keypoints[k0]["pos"],
+                keypoints[k1]["pos"],
+                n_samples,
+                mode="linear",
+            )
+            seg_quat = interpolate_segment_quat(keypoints[k0]["quat"], keypoints[k1]["quat"], n_samples)
+        elif seg_name == "grasp_to_lift":
+            seg_pos = interpolate_segment_pos(
+                keypoints[k0]["pos"],
+                keypoints[k1]["pos"],
+                n_samples,
+                mode="linear",
+            )
+            # Keep original orientation trend in this segment.
+            if (i1 - i0 + 1) == n_samples:
+                seg_quat = interpolate_segment_quat(keypoints[k0]["quat"], quat_ref[i1], n_samples)
+            else:
+                seg_quat = interpolate_segment_quat(keypoints[k0]["quat"], quat_ref[i1], n_samples)
+        elif seg_name == "lift_to_place":
+            # Preserve original carried-object-consistent path/orientation.
+            if (i1 - i0 + 1) == n_samples:
+                seg_pos = pos_ref[i0 : i1 + 1].copy()
+                seg_quat = quat_ref[i0 : i1 + 1].copy()
+            else:
+                seg_pos = interpolate_segment_pos(pos_ref[i0], pos_ref[i1], n_samples, mode="linear")
+                seg_quat = interpolate_segment_quat(quat_ref[i0], quat_ref[i1], n_samples)
+        else:  # place_to_end
+            seg_pos = interpolate_segment_pos(
+                keypoints[k0]["pos"],
+                keypoints[k1]["pos"],
+                n_samples,
+                mode="linear",
+            )
+            seg_quat = interpolate_segment_quat(keypoints[k0]["quat"], keypoints[k1]["quat"], n_samples)
+
+        if i > 0:
+            seg_pos = seg_pos[1:]
+            seg_quat = seg_quat[1:]
+
+        pos_chunks.append(seg_pos)
+        quat_chunks.append(seg_quat)
+
+    pos_aug = np.concatenate(pos_chunks, axis=0)
+    quat_aug = np.concatenate(quat_chunks, axis=0)
+
+    if pos_aug.shape[0] != T:
+        idx = np.linspace(0, pos_aug.shape[0] - 1, T).astype(np.int64)
+        pos_aug = pos_aug[idx]
+        quat_aug = quat_aug[idx]
+
+    return pos_aug.astype(np.float32), quat_aug.astype(np.float32)
+
+
 def _augment_single_demo(
     demo: Dict[str, np.ndarray],
     grasp_variants: int,
@@ -143,10 +305,19 @@ def _augment_single_demo(
     obs_base = demo["obs"]
 
     kps = extract_pickplace_keypoints(pos, grip)
-    a0 = kps["approach_start"]
-    g = kps["grasp"]
-    tr = kps["transport"]
-    rel = kps["release"]
+    T = int(pos.shape[0])
+    a0 = int(kps["approach_start"])
+    g = int(kps["grasp"])
+    lift = int(kps["lift"])
+    tr = int(kps["transport"])
+    rel = int(kps["release"])
+
+    # Keep ordering robust even under rare noisy boundary cases.
+    a0 = max(0, min(a0, T - 5))
+    g = max(a0 + 1, min(g, T - 4))
+    lift = max(g + 1, min(lift, T - 3))
+    tr = max(lift + 1, min(tr, T - 2))
+    rel = max(tr + 1, min(rel, T - 1))
 
     grasp_pos = pos[g]
     local_scale = max(1e-3, float(np.std(pos, axis=0).mean()) * 0.05)
@@ -174,15 +345,19 @@ def _augment_single_demo(
         keep_idx = rng.choice(len(uniq_targets), size=grasp_variants, replace=False)
         uniq_targets = uniq_targets[keep_idx]
 
-    transport_start = pos[max(g + 1, tr - 1)]
-    place_pos = pos[rel]
-    transport_paths = diversify_path(
-        transport_start,
-        place_pos,
-        n=path_variants,
-        steps=max(4, rel - tr + 1),
-        rng=rng,
-    )
+    # path_variants is intentionally not used in this regeneration mode for now.
+    # We preserve lift->place from original trajectory to keep object-state consistency.
+    _ = path_variants
+
+    anchor_indices = [0, a0, g, lift, rel, T - 1]
+    seg_intervals = _allocate_segment_steps_from_ratios(T, anchor_indices)
+    step_allocation = {
+        "start_to_approach": int(seg_intervals[0]),
+        "approach_to_grasp": int(seg_intervals[1]),
+        "grasp_to_lift": int(seg_intervals[2]),
+        "lift_to_place": int(seg_intervals[3]),
+        "place_to_end": int(seg_intervals[4]),
+    }
 
     out = []
     for grasp_target in uniq_targets:
@@ -198,44 +373,42 @@ def _augment_single_demo(
             approach_starts = approach_starts[sel]
 
         for ap in approach_starts:
-            for pth in transport_paths:
-                pos_aug = pos.copy()
-                quat_aug = quat.copy()
+            q_approach = _quat_from_approach_direction(grasp_target - ap)
+            # Keep grasp orientation aligned with approach direction in regenerated path.
+            q_grasp = q_approach.copy()
 
-                approach_len = max(2, g - a0 + 1)
-                alpha = np.linspace(0.0, 1.0, approach_len, dtype=np.float32)[:, None]
-                approach_curve = (1 - alpha) * ap[None, :] + alpha * grasp_target[None, :]
-                pos_aug[a0 : g + 1] = approach_curve
+            kp_poses = {
+                "start": {"idx": 0, "pos": pos[0], "quat": quat[0]},
+                "approach": {"idx": a0, "pos": ap.astype(np.float32), "quat": q_approach},
+                "grasp": {"idx": g, "pos": grasp_target.astype(np.float32), "quat": q_grasp},
+                "lift_peak": {"idx": lift, "pos": pos[lift], "quat": quat[lift]},
+                "place": {"idx": rel, "pos": pos[rel], "quat": quat[rel]},
+                "end": {"idx": T - 1, "pos": pos[T - 1], "quat": quat[T - 1]},
+            }
 
-                q_start = _quat_from_approach_direction(grasp_target - ap)
-                q_end = quat[g]
-                for i_local, t_global in enumerate(range(a0, g + 1)):
-                    blend = float(i_local) / float(max(1, (g - a0)))
-                    quat_aug[t_global] = _quat_slerp(q_start, q_end, blend)
+            pos_aug, quat_aug = build_full_trajectory(
+                keypoints=kp_poses,
+                step_allocation=step_allocation,
+                T=T,
+                pos_ref=pos,
+                quat_ref=quat,
+            )
 
-                if rel >= tr:
-                    nseg = rel - tr + 1
-                    if pth.shape[0] != nseg:
-                        idx = np.linspace(0, pth.shape[0] - 1, nseg).astype(np.int64)
-                        pos_aug[tr : rel + 1] = pth[idx]
-                    else:
-                        pos_aug[tr : rel + 1] = pth
+            obs_aug = {k: v.copy() for k, v in obs_base.items()}
+            obs_aug["robot0_eef_pos"] = pos_aug
+            obs_aug["robot0_eef_quat"] = quat_aug
+            obs_aug["robot0_gripper_qpos"] = grip
 
-                obs_aug = {k: v.copy() for k, v in obs_base.items()}
-                obs_aug["robot0_eef_pos"] = pos_aug
-                obs_aug["robot0_eef_quat"] = quat_aug
-                obs_aug["robot0_gripper_qpos"] = grip
-
-                action_aug = _compose_action_from_pose(pos_aug, quat_aug, grip)
-                out.append(
-                    {
-                        "obs": obs_aug,
-                        "actions": action_aug,
-                        "states": demo.get("states", None),
-                        "rewards": demo.get("rewards", None),
-                        "dones": demo.get("dones", None),
-                    }
-                )
+            action_aug = _compose_action_from_pose(pos_aug, quat_aug, grip)
+            out.append(
+                {
+                    "obs": obs_aug,
+                    "actions": action_aug,
+                    "states": demo.get("states", None),
+                    "rewards": demo.get("rewards", None),
+                    "dones": demo.get("dones", None),
+                }
+            )
 
     return out
 
