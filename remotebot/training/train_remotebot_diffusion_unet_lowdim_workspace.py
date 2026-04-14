@@ -151,6 +151,23 @@ class TrainRemoteBotDiffusionUnetLowdimWorkspace(BaseWorkspace):
 
         return metrics
 
+    def _validate_action_dim_consistency(self, cfg: OmegaConf, dataset: BaseLowdimDataset):
+        cfg_action_dim = int(getattr(cfg, 'action_dim', -1))
+        task_action_dim = int(getattr(cfg.task, 'action_dim', cfg_action_dim))
+
+        sample = dataset[0]
+        if 'action' not in sample:
+            raise ValueError("Dataset sample does not contain 'action' key.")
+        sample_action_dim = int(sample['action'].shape[-1])
+
+        if cfg_action_dim != sample_action_dim or task_action_dim != sample_action_dim:
+            raise ValueError(
+                "Action dimension mismatch detected. "
+                f"cfg.action_dim={cfg_action_dim}, task.action_dim={task_action_dim}, "
+                f"dataset_action_dim={sample_action_dim}. "
+                "Please align config action_dim with dataset action representation."
+            )
+
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
@@ -165,6 +182,7 @@ class TrainRemoteBotDiffusionUnetLowdimWorkspace(BaseWorkspace):
         dataset: BaseLowdimDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseLowdimDataset)
+        self._validate_action_dim_consistency(cfg, dataset)
 
         train_loader_kwargs = OmegaConf.to_container(cfg.dataloader, resolve=True)
         if not isinstance(train_loader_kwargs, dict):

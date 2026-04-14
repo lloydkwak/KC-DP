@@ -35,3 +35,12 @@ Task-space trajectory diversification and feasibility-guided diffusion for cross
 - The codebase was cleaned from legacy `k(q)`-conditioned KC-DP paths.
 - Current package root is `remotebot`.
 
+## Practical limitations (current scope)
+
+- **Oracle gradient semantics**: feasibility guidance gradients are primarily driven by
+	workspace and IK residual terms. Joint-limit and joint smoothness terms are tracked
+	as monitoring costs in the current stable implementation.
+- **TSTD object-state assumption**: augmented trajectories keep non-EE observation keys
+	(e.g., `obs/object`) from source demos. This assumption is most reliable for pick-place
+	free-space phases and may be less accurate for strongly contact-rich tasks.
+

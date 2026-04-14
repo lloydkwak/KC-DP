@@ -444,6 +444,15 @@ def main(checkpoint, output_dir, robot, task, n_test, guidance_weight, lock_join
     cfg.task.env_runner.n_train = 0
     cfg.task.env_runner.n_envs = 1
 
+    # RemoteBot default action semantics:
+    # policy predicts absolute EE pose (pos + rot6d + grip), and env runner
+    # handles conversion to controller command via abs_action pipeline.
+    cfg.task.abs_action = True
+    if hasattr(cfg.task, "dataset"):
+        cfg.task.dataset.abs_action = True
+    cfg.task.env_runner.abs_action = True
+    print("[INFO] Eval action mode: absolute EE pose (runner converts rot6d to controller format)")
+
     cls = hydra.utils.get_class(cfg._target_)
     workspace = cls(cfg=cfg, output_dir=output_dir)
     workspace.load_payload(payload, exclude_keys=None, include_keys=None)

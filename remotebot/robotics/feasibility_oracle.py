@@ -250,7 +250,58 @@ class FeasibilityOracle:
 
     def score_dict(self, trajectory: torch.Tensor) -> Dict[str, torch.Tensor]:
         logf = self.log_feasibility(trajectory)
-        return {
+        out = {
             "log_feasibility": logf,
             "feasibility": torch.exp(logf),
+            "grad_active_terms": torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0], device=trajectory.device),
+            # order: [workspace, ik_residual, joint_limit, smooth, jerk]
         }
+
+        with torch.no_grad():
+            pos = trajectory[..., :3]
+            bsz, horizon, _ = pos.shape
+            out["cost_workspace"] = self._workspace_cost(pos)
+
+            if self.pk_chain is None or self.n_dof <= 0:
+                out["cost_ik_residual"] = torch.zeros(bsz, device=pos.device, dtype=pos.dtype)
+                if horizon > 1:
+                    vel = pos[:, 1:] - pos[:, :-1]
+                    out["cost_smooth"] = vel.pow(2).mean(dim=(1, 2))
+                else:
+                    out["cost_smooth"] = torch.zeros(bsz, device=pos.device, dtype=pos.dtype)
+                if horizon > 2:
+                    acc = pos[:, 2:] - 2 * pos[:, 1:-1] + pos[:, :-2]
+                    out["cost_jerk"] = acc.pow(2).mean(dim=(1, 2))
+                else:
+                    out["cost_jerk"] = torch.zeros(bsz, device=pos.device, dtype=pos.dtype)
+                out["cost_joint_limit"] = torch.zeros(bsz, device=pos.device, dtype=pos.dtype)
+                return out
+
+            target_pos = pos.reshape(-1, 3)
+            q_flat = self._solve_ik_batched(target_pos)
+            fk_pos = self._forward_kinematics_pos(q_flat)
+            out["cost_ik_residual"] = (fk_pos - target_pos).pow(2).sum(dim=-1).view(bsz, horizon).mean(dim=1)
+
+            q_seq = q_flat.view(bsz, horizon, self.n_dof)
+            if (self.q_lower is not None) and (self.q_upper is not None):
+                ql = self.q_lower.view(1, 1, -1)
+                qu = self.q_upper.view(1, 1, -1)
+                v_low = F.relu(ql - q_seq)
+                v_high = F.relu(q_seq - qu)
+                out["cost_joint_limit"] = (v_low + v_high).pow(2).mean(dim=(1, 2))
+            else:
+                out["cost_joint_limit"] = torch.zeros(bsz, device=pos.device, dtype=pos.dtype)
+
+            if horizon > 1:
+                q_vel = q_seq[:, 1:] - q_seq[:, :-1]
+                out["cost_smooth"] = q_vel.pow(2).mean(dim=(1, 2))
+            else:
+                out["cost_smooth"] = torch.zeros(bsz, device=pos.device, dtype=pos.dtype)
+
+            if horizon > 2:
+                q_acc = q_seq[:, 2:] - 2 * q_seq[:, 1:-1] + q_seq[:, :-2]
+                out["cost_jerk"] = q_acc.pow(2).mean(dim=(1, 2))
+            else:
+                out["cost_jerk"] = torch.zeros(bsz, device=pos.device, dtype=pos.dtype)
+
+        return out
