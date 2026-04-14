@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import multiprocessing
+from typing import Optional, Tuple
 
 import click
 import numpy as np
@@ -27,6 +28,7 @@ sys.path.insert(0, os.path.join(_PROJECT_ROOT, "third_party", "diffusion_policy"
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 from omegaconf import OmegaConf
+from remotebot.robotics.feasibility_oracle import FeasibilityOracle
 
 try:
     OmegaConf.register_new_resolver(
@@ -43,18 +45,39 @@ ROBOT_REGISTRY = {
     "Panda": {
         "grip_open": np.array([0.001, -0.001]),
         "grip_closed": np.array([0.039, -0.039]),
+        "ee_frame": "gripper0_grip_site",
+        "workspace_bounds": ((-0.8, -0.8, 0.0), (0.8, 0.8, 1.2)),
+        "urdf_candidates": [
+            "third_party/robosuite/robosuite/models/assets/bullet_data/panda_description/urdf/panda_arm.urdf",
+            "third_party/robosuite/robosuite/models/assets/robots/panda/robot.xml",
+        ],
     },
     "IIWA": {
         "grip_open": np.array([0.49, 0.31, -0.36, -0.47, 0.04, -0.32]),
         "grip_closed": np.array([0.01, 0.04, 0.06, -0.01, 0.02, 0.07]),
+        "ee_frame": "right_hand",
+        "workspace_bounds": ((-0.9, -0.9, 0.0), (0.9, 0.9, 1.3)),
+        "urdf_candidates": [
+            "third_party/robosuite/robosuite/models/assets/bullet_data/iiwa_description/urdf/iiwa14.urdf",
+        ],
     },
     "Jaco": {
         "grip_open": np.array([0.60, 0.05, 0.60, 0.05, 0.60, 0.05]),
         "grip_closed": np.array([0.75, 0.14, 0.75, 0.14, 0.75, 0.14]),
+        "ee_frame": "j2s7s300_ee_link",
+        "workspace_bounds": ((-0.9, -0.9, 0.0), (0.9, 0.9, 1.3)),
+        "urdf_candidates": [
+            "third_party/robosuite/robosuite/models/assets/bullet_data/jaco_description/urdf/j2s7s300.urdf",
+        ],
     },
     "UR5e": {
         "grip_open": np.array([0.52, -0.10, 0.25, 0.51, -0.15, 0.26]),
         "grip_closed": np.array([-0.02, -0.25, -0.21, -0.02, -0.25, -0.21]),
+        "ee_frame": "ee_link",
+        "workspace_bounds": ((-1.0, -1.0, 0.0), (1.0, 1.0, 1.4)),
+        "urdf_candidates": [
+            "third_party/robosuite/robosuite/models/assets/bullet_data/ur5e_description/urdf/ur5e.urdf",
+        ],
     },
 }
 
@@ -65,6 +88,61 @@ _GRIPPER_DEBUG_PRINTED = False
 _ROBOT_OSC_CONFIG_CACHE = {}
 _OSC_DEBUG_PRINTED = set()
 _DATASET_PATH_DEBUG_PRINTED = False
+
+
+def _resolve_existing_path(path_candidates) -> Optional[str]:
+    for rel in path_candidates:
+        if os.path.isabs(rel) and os.path.exists(rel):
+            return rel
+        abs_path = os.path.join(_PROJECT_ROOT, rel)
+        if os.path.exists(abs_path):
+            return abs_path
+    return None
+
+
+def _build_oracle_for_robot(robot_name: str, device: torch.device) -> FeasibilityOracle:
+    robot_cfg = ROBOT_REGISTRY.get(robot_name, {})
+    ws_bounds: Tuple[Tuple[float, float, float], Tuple[float, float, float]] = robot_cfg.get(
+        "workspace_bounds",
+        ((-0.8, -0.8, 0.0), (0.8, 0.8, 1.2)),
+    )
+    urdf_path = _resolve_existing_path(robot_cfg.get("urdf_candidates", []))
+    ee_frame = robot_cfg.get("ee_frame", None)
+
+    oracle = FeasibilityOracle(
+        workspace_bounds=ws_bounds,
+        urdf_path=urdf_path,
+        ee_frame_name=ee_frame,
+        device=str(device),
+    )
+
+    if urdf_path is None:
+        print(
+            f"[WARN] No URDF found for {robot_name}. "
+            "Oracle will run in workspace/smoothness fallback mode."
+        )
+    elif oracle.pk_chain is None:
+        print(
+            f"[WARN] URDF resolved for {robot_name} but PK chain init failed. "
+            "Falling back to workspace/smoothness oracle."
+        )
+    else:
+        print(f"[INFO] Oracle loaded PK chain for {robot_name}: urdf={urdf_path}, ee_frame={ee_frame}")
+
+    return oracle
+
+
+def _apply_joint_lock(oracle: FeasibilityOracle, lock_joint: Optional[str]):
+    if not lock_joint:
+        return
+    try:
+        idx_str, val_str = lock_joint.split(":", 1)
+        jidx = int(idx_str.strip())
+        jval = float(val_str.strip())
+        oracle.set_joint_fault(jidx, jval)
+        print(f"[INFO] Joint fault lock applied: joint[{jidx}]={jval}")
+    except Exception as e:
+        print(f"[WARN] Invalid --lock_joint format '{lock_joint}'. Expected 'index:value'. error={e}")
 
 
 _ROBOT_OSC_PRESETS = {
@@ -335,7 +413,9 @@ RobomimicLowdimWrapper.step = patched_step
 @click.option("-r", "--robot", default="Panda", help="Eval Robot (Panda, IIWA, Jaco, UR5e)")
 @click.option("-t", "--task", default=None, help="Override Task")
 @click.option("-n", "--n_test", default=50, help="Number of rollouts")
-def main(checkpoint, output_dir, robot, task, n_test):
+@click.option("--guidance_weight", default=1.0, type=float, help="Feasibility guidance base weight (0 to disable)")
+@click.option("--lock_joint", default=None, type=str, help="Optional joint fault lock as 'joint_idx:value'")
+def main(checkpoint, output_dir, robot, task, n_test, guidance_weight, lock_joint):
     global TARGET_ROBOT, TARGET_TASK, _GRIPPER_DEBUG_PRINTED
     TARGET_ROBOT = robot
     TARGET_TASK = task
@@ -380,6 +460,16 @@ def main(checkpoint, output_dir, robot, task, n_test):
         policy = workspace.ema_model
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    if guidance_weight > 0.0 and hasattr(policy, "set_feasibility_oracle"):
+        oracle = _build_oracle_for_robot(robot_name=robot, device=device)
+        _apply_joint_lock(oracle, lock_joint)
+        policy.set_feasibility_oracle(oracle)
+        policy.guidance_weight_base = float(guidance_weight)
+        print(f"[INFO] Feasibility guidance enabled (weight={policy.guidance_weight_base:.4f})")
+    else:
+        print("[INFO] Feasibility guidance disabled (guidance_weight <= 0)")
+
     policy.to(device)
     policy.eval()
 

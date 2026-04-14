@@ -1,3 +1,12 @@
+"""
+LEGACY MODULE (k(q)-centric)
+============================
+
+This file is retained only for backward research utilities and ablation
+experiments. It is NOT used by the default RemoteBot task-space training/
+evaluation pipeline.
+"""
+
 import os
 import tempfile
 import numpy as np
